@@ -1097,10 +1097,13 @@ static int runSelfTestIFMA() {
     }
 
     // Block path (genGroupIFMABlocks + hash16Blocks) vs Point path (genGroupIFMA
-    // + computeHash160BatchBinSingle2): compare final hash160 over a whole group.
-    // This is the exact production path -- a mismatch localizes the C.1c bug.
-    int fBlocks = 0;
+    // + computeHash160BatchBinSingle2) across MULTIPLE groups, reusing one block
+    // buffer exactly as the production search does. This replicates Part B's
+    // multi-group scenario, so it catches advance / buffer-reuse bugs that a
+    // single-group check misses. fBlocks = hash mismatches; fAdv = advance drift.
+    int fBlocks = 0, fAdv = 0;
     {
+        const int NGROUPS = 6;
         std::vector<Point> Gn(CPU_GROUP_SIZE / 2); Point _2Gn;
         buildGeneratorTable(secp, Gn.data(), _2Gn);
         Int base; for (int i = 0; i < NB64BLOCK; i++) base.bits64[i] = 0;
@@ -1108,27 +1111,30 @@ static int runSelfTestIFMA() {
         Int half; half.SetInt32(CPU_GROUP_SIZE / 2);
         Int center; center.Set(&base); center.Add(&half);
 
-        Point startP1 = secp.ComputePublicKey(&center);
-        std::vector<Int> dx1(CPU_GROUP_SIZE / 2 + 1);
+        Point sp1 = secp.ComputePublicKey(&center);   // point path startP
+        Point sp2 = sp1;                               // block path startP (same start)
+        std::vector<Int> dx1(CPU_GROUP_SIZE / 2 + 1), dx2(CPU_GROUP_SIZE / 2 + 1);
         IntGroup grp1(CPU_GROUP_SIZE / 2 + 1); grp1.Set(dx1.data());
+        IntGroup grp2(CPU_GROUP_SIZE / 2 + 1); grp2.Set(dx2.data());
         std::vector<Point> pts(CPU_GROUP_SIZE);
-        genGroupIFMA(startP1, Gn.data(), _2Gn, dx1, grp1, pts.data());
+        std::vector<uint8_t> blocks((size_t)CPU_GROUP_SIZE * 64);
+        initBlocks(blocks.data());                     // ONCE -- buffer is reused below
         std::vector<uint8_t> hashA((size_t)CPU_GROUP_SIZE * 20);
         ALIGN64 uint8_t hr[HASH_BATCH_SIZE][20];
-        for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
-            computeHash160BatchBinSingle2(&pts[i], hr);
-            for (int L = 0; L < HASH_BATCH_SIZE; L++) std::memcpy(&hashA[(size_t)(i + L) * 20], hr[L], 20);
-        }
 
-        Point startP2 = secp.ComputePublicKey(&center);
-        std::vector<Int> dx2(CPU_GROUP_SIZE / 2 + 1);
-        IntGroup grp2(CPU_GROUP_SIZE / 2 + 1); grp2.Set(dx2.data());
-        std::vector<uint8_t> blocks((size_t)CPU_GROUP_SIZE * 64); initBlocks(blocks.data());
-        genGroupIFMABlocks(startP2, Gn.data(), _2Gn, dx2, grp2, blocks.data());
-        for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
-            hash16Blocks(blocks.data() + (long)i * 64, hr);
-            for (int L = 0; L < HASH_BATCH_SIZE; L++)
-                if (std::memcmp(&hashA[(size_t)(i + L) * 20], hr[L], 20) != 0) fBlocks++;
+        for (int g = 0; g < NGROUPS; g++) {
+            genGroupIFMA(sp1, Gn.data(), _2Gn, dx1, grp1, pts.data());
+            for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
+                computeHash160BatchBinSingle2(&pts[i], hr);
+                for (int L = 0; L < HASH_BATCH_SIZE; L++) std::memcpy(&hashA[(size_t)(i + L) * 20], hr[L], 20);
+            }
+            genGroupIFMABlocks(sp2, Gn.data(), _2Gn, dx2, grp2, blocks.data());
+            for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
+                hash16Blocks(blocks.data() + (long)i * 64, hr);
+                for (int L = 0; L < HASH_BATCH_SIZE; L++)
+                    if (std::memcmp(&hashA[(size_t)(i + L) * 20], hr[L], 20) != 0) fBlocks++;
+            }
+            if (!sp1.x.IsEqual(&sp2.x) || !sp1.y.IsEqual(&sp2.y)) fAdv++; // advance drift
         }
     }
 
@@ -1151,9 +1157,10 @@ static int runSelfTestIFMA() {
     line("genGroupIFMA         ", fGroup);
     line("to_compressed8       ", fComp);
     line("block path vs point  ", fBlocks);
+    line("block advance drift  ", fAdv);
 
     int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr
-                 + fGenP + fGenM + fCompGen + fGroup + fComp + fBlocks;
+                 + fGenP + fGenM + fCompGen + fGroup + fComp + fBlocks + fAdv;
     std::cout << "================================================\n";
     std::cout << (failures == 0 ? "IFMA FIELD SELFTEST PASSED\n" : "IFMA FIELD SELFTEST FAILED\n");
     return failures == 0 ? 0 : 1;
