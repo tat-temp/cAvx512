@@ -401,24 +401,28 @@ static inline void storeCompScalar(Point &pt, uint8_t *blk) {
     for (int b = 0; b < 32; b++) blk[1 + b] = xb[31 - b]; // little-endian -> big-endian
 }
 
-// Hash 16 consecutive 64-byte blocks (at B) in place to 16 hash160 outputs.
-// Mirrors computeHash160BatchBinSingle2's SHA->RIPEMD, but the blocks are
-// already built, so there is no Point read / byte-shuffle per call.
+// Hash 16 consecutive 64-byte blocks (at B) to 16 hash160 outputs. NOT in place:
+// SHA reads the blocks into a separate 'digest' scratch, and RIPEMD reads/pads
+// that scratch. This matters because ripemd160avx512_32 writes its own padding
+// into bytes [32..63] of its input -- hashing in place would clobber the SHA
+// message padding (0x80 at [33], length at [62..63]) that initBlocks lays down
+// once and the buffer relies on persisting across reused groups.
 static inline void hash16Blocks(uint8_t *B, uint8_t outHash[][20]) {
+    ALIGN64 uint8_t digest[HASH_BATCH_SIZE][64]; // SHA out / RIPEMD in (RIPEMD pads [32..63])
     sha256_avx512_16B(
         B + 0 * 64,  B + 1 * 64,  B + 2 * 64,  B + 3 * 64,
         B + 4 * 64,  B + 5 * 64,  B + 6 * 64,  B + 7 * 64,
         B + 8 * 64,  B + 9 * 64,  B + 10 * 64, B + 11 * 64,
         B + 12 * 64, B + 13 * 64, B + 14 * 64, B + 15 * 64,
-        B + 0 * 64,  B + 1 * 64,  B + 2 * 64,  B + 3 * 64,
-        B + 4 * 64,  B + 5 * 64,  B + 6 * 64,  B + 7 * 64,
-        B + 8 * 64,  B + 9 * 64,  B + 10 * 64, B + 11 * 64,
-        B + 12 * 64, B + 13 * 64, B + 14 * 64, B + 15 * 64);
+        digest[0],  digest[1],  digest[2],  digest[3],
+        digest[4],  digest[5],  digest[6],  digest[7],
+        digest[8],  digest[9],  digest[10], digest[11],
+        digest[12], digest[13], digest[14], digest[15]);
     ripemd160avx512::ripemd160avx512_32(
-        B + 0 * 64,  B + 1 * 64,  B + 2 * 64,  B + 3 * 64,
-        B + 4 * 64,  B + 5 * 64,  B + 6 * 64,  B + 7 * 64,
-        B + 8 * 64,  B + 9 * 64,  B + 10 * 64, B + 11 * 64,
-        B + 12 * 64, B + 13 * 64, B + 14 * 64, B + 15 * 64,
+        digest[0],  digest[1],  digest[2],  digest[3],
+        digest[4],  digest[5],  digest[6],  digest[7],
+        digest[8],  digest[9],  digest[10], digest[11],
+        digest[12], digest[13], digest[14], digest[15],
         outHash[0],  outHash[1],  outHash[2],  outHash[3],
         outHash[4],  outHash[5],  outHash[6],  outHash[7],
         outHash[8],  outHash[9],  outHash[10], outHash[11],
