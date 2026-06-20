@@ -166,12 +166,57 @@ static inline FieldVec8 mul(const FieldVec8 &a, const FieldVec8 &b) {
 
     FieldVec8 r;
     r.n[0] = r0; r.n[1] = r1; r.n[2] = r2; r.n[3] = r3; r.n[4] = r4;
+    normalize_weak(r);   // limbs < 2^52 so the result can feed another mul/sqr
     return r;
 }
 
 // a^2 (mod p). First-correct version: just mul(a, a). (A dedicated squaring that
 // halves the cross-product count is a later optimization.)
 static inline FieldVec8 sqr(const FieldVec8 &a) { return mul(a, a); }
+
+// Broadcast one Int field element to all 8 lanes.
+static inline FieldVec8 broadcast(const Int &a) {
+    uint64_t L[5]; int_to_limbs(a, L);
+    FieldVec8 r;
+    for (int k = 0; k < 5; k++) r.n[k] = _mm512_set1_epi64((long long)L[k]);
+    return r;
+}
+
+// Compute 8 EC points  P = base (+/-) G  in affine coords, lane-wise:
+//   spx,spy = base.x, base.y (broadcast to all lanes)
+//   gx,gy   = G.x, G.y for 8 different points G (per lane)
+//   inv     = 1/(G.x - base.x) per lane (precomputed batch inverse)
+//   plus    = true for base+G, false for base-G ( -G == (G.x, -G.y) )
+// Mirrors the scalar slope formula used by the search loop. All add/sub/neg
+// outputs are re-normalized before feeding a mul (mul/sqr self-normalize).
+static inline void gen8(const FieldVec8 &spx, const FieldVec8 &spy,
+                        const FieldVec8 &gx, const FieldVec8 &gy,
+                        const FieldVec8 &inv, bool plus,
+                        FieldVec8 &rx, FieldVec8 &ry) {
+    FieldVec8 dy;
+    if (plus) {
+        dy = sub(gy, spy);                 // dy = G.y - base.y
+    } else {
+        FieldVec8 ng = neg(gy); normalize_weak(ng);
+        dy = sub(ng, spy);                 // dy = -G.y - base.y
+    }
+    normalize_weak(dy);
+
+    FieldVec8 s  = mul(dy, inv);           // s = dy / (G.x - base.x)
+    FieldVec8 p2 = sqr(s);                 // s^2
+
+    rx = sub(p2, spx);
+    rx = sub(rx, gx);                      // rx = s^2 - base.x - G.x
+    normalize_weak(rx);
+
+    FieldVec8 t = sub(gx, rx);             // G.x - rx
+    normalize_weak(t);
+    FieldVec8 ts = mul(t, s);              // s * (G.x - rx)
+
+    if (plus) ry = sub(ts, gy);           // ry = s*(G.x-rx) - G.y
+    else      ry = add(ts, gy);           // ry = s*(G.x-rx) + G.y
+    normalize_weak(ry);
+}
 
 } // namespace ifma
 

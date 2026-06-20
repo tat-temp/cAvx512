@@ -752,6 +752,45 @@ static int runSelfTestIFMA() {
         }
     }
 
+    // gen8: 8-lane EC point add (base +/- G), validated against scalar AddDirect.
+    int fGenP = 0, fGenM = 0;
+    for (int b = 0; b < 500; b++) {
+        Int kb; for (int i = 0; i < NB64BLOCK; i++) kb.bits64[i] = 0;
+        kb.bits64[0] = ifma_next_rand() | 1ULL; kb.bits64[1] = ifma_next_rand();
+        Point P = secp.ComputePublicKey(&kb);
+
+        Int gx[8], gy[8], inv[8];
+        Point G[8];
+        for (int k = 0; k < 8; k++) {
+            Int kk; for (int i = 0; i < NB64BLOCK; i++) kk.bits64[i] = 0;
+            kk.bits64[0] = ifma_next_rand() | 1ULL; kk.bits64[1] = ifma_next_rand();
+            G[k] = secp.ComputePublicKey(&kk);
+            gx[k].Set(&G[k].x); gy[k].Set(&G[k].y);
+            Int d; d.ModSub(&G[k].x, &P.x); d.ModInv(); inv[k].Set(&d);
+        }
+        ifma::FieldVec8 SPX = ifma::broadcast(P.x), SPY = ifma::broadcast(P.y);
+        ifma::FieldVec8 GX = ifma::load8(gx), GY = ifma::load8(gy), INV = ifma::load8(inv);
+        ifma::FieldVec8 RX, RY;
+        uint64_t ox[8][5], oy[8][5];
+
+        ifma::gen8(SPX, SPY, GX, GY, INV, true, RX, RY);
+        ifma::store8(RX, ox); ifma::store8(RY, oy);
+        for (int k = 0; k < 8; k++) {
+            Int gotx = ifma_limbsToInt(ox[k]), goty = ifma_limbsToInt(oy[k]);
+            Point e = secp.AddDirect(P, G[k]);
+            if (!gotx.IsEqual(&e.x) || !goty.IsEqual(&e.y)) fGenP++;
+        }
+
+        ifma::gen8(SPX, SPY, GX, GY, INV, false, RX, RY);
+        ifma::store8(RX, ox); ifma::store8(RY, oy);
+        for (int k = 0; k < 8; k++) {
+            Int gotx = ifma_limbsToInt(ox[k]), goty = ifma_limbsToInt(oy[k]);
+            Point negG; negG.x.Set(&G[k].x); negG.y.Set(&G[k].y); negG.y.ModNeg(); negG.z.SetInt32(1);
+            Point e = secp.AddDirect(P, negG);
+            if (!gotx.IsEqual(&e.x) || !goty.IsEqual(&e.y)) fGenM++;
+        }
+    }
+
     auto line = [](const char *name, int fails) {
         std::cout << name << " : " << (fails == 0 ? "OK" : "FAIL");
         if (fails) std::cout << " (" << fails << " mismatches)";
@@ -765,8 +804,10 @@ static int runSelfTestIFMA() {
     line("normalize            ", fNorm);
     line("mul (IFMA)           ", fMul);
     line("sqr (IFMA)           ", fSqr);
+    line("gen8 plus            ", fGenP);
+    line("gen8 minus           ", fGenM);
 
-    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr;
+    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr + fGenP + fGenM;
     std::cout << "================================================\n";
     std::cout << (failures == 0 ? "IFMA FIELD SELFTEST PASSED\n" : "IFMA FIELD SELFTEST FAILED\n");
     return failures == 0 ? 0 : 1;
