@@ -691,7 +691,7 @@ static uint64_t processGroupGenOnly(Point &startP, Point *Gn, Point &_2Gn,
     return sink;
 }
 
-enum class BenchMode { Full, Gen, Hash };
+enum class BenchMode { Full, Gen, Hash, Inv };
 
 //------------------------------------------------------------------------------
 // 0.1 Benchmark mode: run a fixed number of batches/thread with no I/O and no
@@ -758,6 +758,21 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
             for (long long b = 0; b < batchesPerThread; ++b) {
                 sink += processGroupGenOnly(startP, Gn.data(), _2Gn, dx, grp);
             }
+        } else if (mode == BenchMode::Inv) {
+            // Batch inversion (+ its dx setup) only. ModInv overwrites dx in place,
+            // so refill the differences each iteration, invert, then consume them.
+            const int CENTER  = CPU_GROUP_SIZE / 2;
+            const int hLength = CENTER - 1;
+            for (long long b = 0; b < batchesPerThread; ++b) {
+                int j;
+                for (j = 0; j < hLength; j++) dx[j].ModSub(&Gn[j].x, &startP.x);
+                dx[j].ModSub(&Gn[j].x, &startP.x);
+                dx[j + 1].ModSub(&_2Gn.x, &startP.x);
+                grp.ModInv();
+                uint64_t acc = 0;
+                for (int k = 0; k <= CENTER; k++) acc ^= dx[k].bits64[0];
+                sink += acc;
+            }
         } else { // Full
             for (long long b = 0; b < batchesPerThread; ++b) {
                 int idx = processGroupFused(startP, Gn.data(), _2Gn, dx, grp, target16, dummy);
@@ -773,6 +788,7 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
     const double mkeys = secs > 0.0 ? (totalKeys / secs / 1e6) : 0.0;
     const char *modeName = mode == BenchMode::Gen  ? "GEN  (point-gen only)"
                          : mode == BenchMode::Hash ? "HASH (hash160 only)"
+                         : mode == BenchMode::Inv  ? "INV  (batch inversion only)"
                                                    : "FULL (gen + hash)";
 
     std::cout << "================= BENCHMARK =================\n";
@@ -795,6 +811,7 @@ static void printUsage(const char* programName) {
     std::cerr << "       " << programName << " --bench [batches] [threads]       (full gen+hash)\n";
     std::cerr << "       " << programName << " --bench-gen [batches] [threads]   (point-gen only)\n";
     std::cerr << "       " << programName << " --bench-hash [batches] [threads]  (hash160 only)\n";
+    std::cerr << "       " << programName << " --bench-inv [batches] [threads]   (batch inversion only)\n";
 }
 
 static std::string formatElapsedTime(double seconds) {
@@ -851,10 +868,12 @@ int main(int argc, char* argv[])
         }
         if (!std::strcmp(argv[i], "--bench") ||
             !std::strcmp(argv[i], "--bench-gen") ||
-            !std::strcmp(argv[i], "--bench-hash")) {
+            !std::strcmp(argv[i], "--bench-hash") ||
+            !std::strcmp(argv[i], "--bench-inv")) {
             BenchMode mode = BenchMode::Full;
             if (!std::strcmp(argv[i], "--bench-gen"))  mode = BenchMode::Gen;
             if (!std::strcmp(argv[i], "--bench-hash")) mode = BenchMode::Hash;
+            if (!std::strcmp(argv[i], "--bench-inv"))  mode = BenchMode::Inv;
             long long batches = 1000;
             int benchThreads = 0; // 0 => all available procs
             if (i + 1 < argc) { long long v = std::strtoll(argv[i + 1], nullptr, 10); if (v > 0) batches = v; }
