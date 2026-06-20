@@ -1,4 +1,4 @@
-//g++ -std=c++17 -Ofast -ffast-math -funroll-loops -ftree-vectorize -fstrict-aliasing -fno-semantic-interposition -fvect-cost-model=unlimited -fno-trapping-math -fipa-ra -mavx512f -mavx512vl -mavx512bw -mavx512dq -fipa-modref -flto -fassociative-math -fopenmp -mavx2 -mbmi2 -madx -o Cyclone Cyclone.cpp SECP256K1.cpp Int.cpp IntGroup.cpp IntMod.cpp Point.cpp ripemd160_avx2.cpp p2pkh_decoder.cpp sha256_avx2.cpp ripemd160_avx512.cpp sha256_avx512.cpp
+//g++ -std=c++17 -Ofast -ffast-math -funroll-loops -ftree-vectorize -fstrict-aliasing -fno-semantic-interposition -fvect-cost-model=unlimited -fno-trapping-math -fipa-ra -mavx512f -mavx512vl -mavx512bw -mavx512dq -mavx512ifma -fipa-modref -flto -fassociative-math -fopenmp -mavx2 -mbmi2 -madx -o Cyclone Cyclone.cpp SECP256K1.cpp Int.cpp IntGroup.cpp IntMod.cpp Point.cpp ripemd160_avx2.cpp p2pkh_decoder.cpp sha256_avx2.cpp ripemd160_avx512.cpp sha256_avx512.cpp
 
 //The software is developed for solving Satoshi's puzzles; any use for illegal purposes is strictly prohibited. The author is not responsible for any actions taken by the user when using this software for unlawful activities.
 #include <immintrin.h>
@@ -684,7 +684,7 @@ static int runSelfTestIFMA() {
 
     std::cout << "============== IFMA FIELD SELFTEST ==============\n";
     const int BATCHES = 4000;      // 8 lanes -> 32k random vectors per op
-    int fRound = 0, fSoA = 0, fAdd = 0, fSub = 0, fNeg = 0, fNorm = 0;
+    int fRound = 0, fSoA = 0, fAdd = 0, fSub = 0, fNeg = 0, fNorm = 0, fMul = 0, fSqr = 0;
 
     for (int b = 0; b < BATCHES; b++) {
         Int a[8], bb[8];
@@ -736,6 +736,20 @@ static int runSelfTestIFMA() {
             Int exp; exp.Set(&a[j]); exp.ModAdd(&bb[j]);
             if (!got.IsEqual(&exp)) fNorm++;
         }
+
+        C = ifma::mul(A, B); ifma::store8(C, o);
+        for (int j = 0; j < 8; j++) {
+            Int got = ifma_limbsToInt(o[j]);
+            Int exp; exp.ModMulK1(&a[j], &bb[j]);
+            if (!got.IsEqual(&exp)) fMul++;
+        }
+
+        C = ifma::sqr(A); ifma::store8(C, o);
+        for (int j = 0; j < 8; j++) {
+            Int got = ifma_limbsToInt(o[j]);
+            Int exp; exp.ModSquareK1(&a[j]);
+            if (!got.IsEqual(&exp)) fSqr++;
+        }
     }
 
     auto line = [](const char *name, int fails) {
@@ -749,8 +763,10 @@ static int runSelfTestIFMA() {
     line("sub                  ", fSub);
     line("neg                  ", fNeg);
     line("normalize            ", fNorm);
+    line("mul (IFMA)           ", fMul);
+    line("sqr (IFMA)           ", fSqr);
 
-    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm;
+    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr;
     std::cout << "================================================\n";
     std::cout << (failures == 0 ? "IFMA FIELD SELFTEST PASSED\n" : "IFMA FIELD SELFTEST FAILED\n");
     return failures == 0 ? 0 : 1;

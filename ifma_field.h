@@ -22,6 +22,7 @@ namespace ifma {
 static const uint64_t MASK52 = 0xFFFFFFFFFFFFFULL;
 static const uint64_t MASK48 = 0x0FFFFFFFFFFFFULL;
 static const uint64_t R256   = 0x1000003D1ULL;       // 2^256 mod p
+static const uint64_t RR260  = 0x1000003D10ULL;      // 2^260 mod p (== R256 << 4)
 
 // 2*p in radix-2^52 (a value == 0 mod p, large enough to keep sub/neg positive).
 static const uint64_t TWO_P[5] = {
@@ -118,6 +119,59 @@ static inline void normalize_weak(FieldVec8 &v) {
     c = _mm512_srli_epi64(v.n[2], 52); v.n[2] = _mm512_and_si512(v.n[2], M52); v.n[3] = _mm512_add_epi64(v.n[3], c);
     c = _mm512_srli_epi64(v.n[3], 52); v.n[3] = _mm512_and_si512(v.n[3], M52); v.n[4] = _mm512_add_epi64(v.n[4], c);
 }
+
+// a * b (mod p), 8-lane, AVX-512 IFMA. Inputs must be weakly normalized
+// (each limb < 2^52, top limb small). Output is congruent mod p with limbs
+// < 2^55 (not fully canonical -- callers normalize when needed). Requires
+// -mavx512ifma. p reduction uses 2^260 == RR260 (limb-5 boundary).
+static inline FieldVec8 mul(const FieldVec8 &a, const FieldVec8 &b) {
+    const __m512i M52 = _mm512_set1_epi64((long long)MASK52);
+    const __m512i RR  = _mm512_set1_epi64((long long)RR260);
+    const __m512i Z   = _mm512_setzero_si512();
+
+    // Phase 1: schoolbook 5x5 -> 10 columns (each accumulates <=9 terms < 2^52).
+    __m512i d[10];
+    for (int i = 0; i < 10; i++) d[i] = Z;
+    for (int i = 0; i < 5; i++) {
+        for (int j = 0; j < 5; j++) {
+            d[i + j]     = _mm512_madd52lo_epu64(d[i + j],     a.n[i], b.n[j]);
+            d[i + j + 1] = _mm512_madd52hi_epu64(d[i + j + 1], a.n[i], b.n[j]);
+        }
+    }
+
+    // Phase 2: carry-propagate so every d[k] < 2^52 (required as fold multiplicands).
+    __m512i c;
+    c = _mm512_srli_epi64(d[0], 52); d[0] = _mm512_and_si512(d[0], M52); d[1] = _mm512_add_epi64(d[1], c);
+    c = _mm512_srli_epi64(d[1], 52); d[1] = _mm512_and_si512(d[1], M52); d[2] = _mm512_add_epi64(d[2], c);
+    c = _mm512_srli_epi64(d[2], 52); d[2] = _mm512_and_si512(d[2], M52); d[3] = _mm512_add_epi64(d[3], c);
+    c = _mm512_srli_epi64(d[3], 52); d[3] = _mm512_and_si512(d[3], M52); d[4] = _mm512_add_epi64(d[4], c);
+    c = _mm512_srli_epi64(d[4], 52); d[4] = _mm512_and_si512(d[4], M52); d[5] = _mm512_add_epi64(d[5], c);
+    c = _mm512_srli_epi64(d[5], 52); d[5] = _mm512_and_si512(d[5], M52); d[6] = _mm512_add_epi64(d[6], c);
+    c = _mm512_srli_epi64(d[6], 52); d[6] = _mm512_and_si512(d[6], M52); d[7] = _mm512_add_epi64(d[7], c);
+    c = _mm512_srli_epi64(d[7], 52); d[7] = _mm512_and_si512(d[7], M52); d[8] = _mm512_add_epi64(d[8], c);
+    c = _mm512_srli_epi64(d[8], 52); d[8] = _mm512_and_si512(d[8], M52); d[9] = _mm512_add_epi64(d[9], c);
+
+    // Phase 3: fold high limbs d[5..9] into low via 2^260 == RR.
+    //   d[5+m] contributes lo52(d[5+m]*RR) to column m and hi52 to column m+1.
+    __m512i r0 = d[0], r1 = d[1], r2 = d[2], r3 = d[3], r4 = d[4], r5 = Z;
+    r0 = _mm512_madd52lo_epu64(r0, d[5], RR); r1 = _mm512_madd52hi_epu64(r1, d[5], RR);
+    r1 = _mm512_madd52lo_epu64(r1, d[6], RR); r2 = _mm512_madd52hi_epu64(r2, d[6], RR);
+    r2 = _mm512_madd52lo_epu64(r2, d[7], RR); r3 = _mm512_madd52hi_epu64(r3, d[7], RR);
+    r3 = _mm512_madd52lo_epu64(r3, d[8], RR); r4 = _mm512_madd52hi_epu64(r4, d[8], RR);
+    r4 = _mm512_madd52lo_epu64(r4, d[9], RR); r5 = _mm512_madd52hi_epu64(r5, d[9], RR);
+
+    // Phase 4: fold r5 (weight 2^260) back into r0/r1.
+    r0 = _mm512_madd52lo_epu64(r0, r5, RR);
+    r1 = _mm512_madd52hi_epu64(r1, r5, RR);
+
+    FieldVec8 r;
+    r.n[0] = r0; r.n[1] = r1; r.n[2] = r2; r.n[3] = r3; r.n[4] = r4;
+    return r;
+}
+
+// a^2 (mod p). First-correct version: just mul(a, a). (A dedicated squaring that
+// halves the cross-product count is a later optimization.)
+static inline FieldVec8 sqr(const FieldVec8 &a) { return mul(a, a); }
 
 } // namespace ifma
 
