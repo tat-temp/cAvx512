@@ -372,6 +372,60 @@ static void computeHash160BatchBinSingle2(
 }
 
 //------------------------------------------------------------------------------
+// C.1c block-buffer path: hash straight from pre-built SHA input blocks, with no
+// per-point Point round-trip. A group's blocks live in one CPU_GROUP_SIZE x 64
+// buffer; the gen phase writes bytes [0..32] (parity + big-endian x) of each,
+// initBlocks lays down the constant message padding once, and the in-place SHA
+// (which only writes the low 32 bytes) leaves that padding intact across groups.
+//------------------------------------------------------------------------------
+
+// One-time formatting of a CPU_GROUP_SIZE x 64 block buffer: zero it, then set
+// the 33-byte-message padding (0x80 terminator at [33], bit-length 264 at
+// [62..63]). The gen phase overwrites only [0..32]; SHA overwrites only [0..31].
+static void initBlocks(uint8_t *blocks) {
+    std::memset(blocks, 0, (size_t)CPU_GROUP_SIZE * 64);
+    for (int i = 0; i < CPU_GROUP_SIZE; i++) {
+        uint8_t *b = blocks + (long)i * 64;
+        b[33] = 0x80;
+        b[62] = (uint8_t)((33 * 8) >> 8); // 0x01
+        b[63] = (uint8_t)((33 * 8));      // 0x08
+    }
+}
+
+// Write one scalar Point as a compressed-key SHA block (parity + big-endian x at
+// bytes [0..32]); padding bytes [33..63] are left to initBlocks. Used for the
+// genGroupIFMABlocks scalar tail (the lanes gen8 does not cover).
+static inline void storeCompScalar(Point &pt, uint8_t *blk) {
+    blk[0] = isEven(&pt.y) ? 0x02 : 0x03;
+    uint8_t *xb = (&pt.x)->GetBytes();
+    for (int b = 0; b < 32; b++) blk[1 + b] = xb[31 - b]; // little-endian -> big-endian
+}
+
+// Hash 16 consecutive 64-byte blocks (at B) in place to 16 hash160 outputs.
+// Mirrors computeHash160BatchBinSingle2's SHA->RIPEMD, but the blocks are
+// already built, so there is no Point read / byte-shuffle per call.
+static inline void hash16Blocks(uint8_t *B, uint8_t outHash[][20]) {
+    sha256_avx512_16B(
+        B + 0 * 64,  B + 1 * 64,  B + 2 * 64,  B + 3 * 64,
+        B + 4 * 64,  B + 5 * 64,  B + 6 * 64,  B + 7 * 64,
+        B + 8 * 64,  B + 9 * 64,  B + 10 * 64, B + 11 * 64,
+        B + 12 * 64, B + 13 * 64, B + 14 * 64, B + 15 * 64,
+        B + 0 * 64,  B + 1 * 64,  B + 2 * 64,  B + 3 * 64,
+        B + 4 * 64,  B + 5 * 64,  B + 6 * 64,  B + 7 * 64,
+        B + 8 * 64,  B + 9 * 64,  B + 10 * 64, B + 11 * 64,
+        B + 12 * 64, B + 13 * 64, B + 14 * 64, B + 15 * 64);
+    ripemd160avx512::ripemd160avx512_32(
+        B + 0 * 64,  B + 1 * 64,  B + 2 * 64,  B + 3 * 64,
+        B + 4 * 64,  B + 5 * 64,  B + 6 * 64,  B + 7 * 64,
+        B + 8 * 64,  B + 9 * 64,  B + 10 * 64, B + 11 * 64,
+        B + 12 * 64, B + 13 * 64, B + 14 * 64, B + 15 * 64,
+        outHash[0],  outHash[1],  outHash[2],  outHash[3],
+        outHash[4],  outHash[5],  outHash[6],  outHash[7],
+        outHash[8],  outHash[9],  outHash[10], outHash[11],
+        outHash[12], outHash[13], outHash[14], outHash[15]);
+}
+
+//------------------------------------------------------------------------------
 // Phase 0 instrumentation: shared building blocks for --bench and --selftest.
 //
 // processGroupFused (below) is the single generate+hash+compare routine shared by
@@ -506,8 +560,10 @@ static std::string hash160ToAddress(const std::vector<uint8_t> &h160) {
 // so the self-test can drive the exact production search path.
 static void genGroupIFMA(Point &startP, Point *Gn, Point &_2Gn,
                          std::vector<Int> &dx, IntGroup &grp, Point *pts);
+static void genGroupIFMABlocks(Point &startP, Point *Gn, Point &_2Gn,
+                               std::vector<Int> &dx, IntGroup &grp, uint8_t *blocks);
 static int processGroupIFMA(Point &startP, Point *Gn, Point &_2Gn,
-                            std::vector<Int> &dx, IntGroup &grp, Point *pts,
+                            std::vector<Int> &dx, IntGroup &grp, uint8_t *blocks,
                             __m128i target16, const uint8_t *targetHash160);
 
 //------------------------------------------------------------------------------
@@ -591,14 +647,15 @@ static int runSelfTest(Secp256K1 &secp) {
     std::vector<Int> dx(CPU_GROUP_SIZE / 2 + 1);
     IntGroup grp(CPU_GROUP_SIZE / 2 + 1);
     grp.Set(dx.data());
-    std::vector<Point> pts(CPU_GROUP_SIZE);   // scratch for the IFMA generator
+    std::vector<uint8_t> blocks((size_t)CPU_GROUP_SIZE * 64); // SHA-block scratch
+    initBlocks(blocks.data());
     __m128i target16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(targetH.data()));
 
     bool found = false;
     std::string foundPrivHex, foundWif;
     while (!found) {
         if (priv.IsGreater(&endK)) break;
-        int idx = processGroupIFMA(startP, Gn.data(), _2Gn, dx, grp, pts.data(),
+        int idx = processGroupIFMA(startP, Gn.data(), _2Gn, dx, grp, blocks.data(),
                                    target16, targetH.data());
         if (idx >= 0) {
             Int mPriv; mPriv.Set(&priv);
@@ -760,21 +817,81 @@ static void genGroupIFMA(Point &startP, Point *Gn, Point &_2Gn,
     startP = pp;
 }
 
-// Production IFMA search path: generate the whole 4096-point group with the
-// 8-lane genGroupIFMA, then hash + compare each HASH_BATCH_SIZE chunk. Same
-// contract as processGroupFused (returns the in-group index of the first match
-// or -1, advances startP by CPU_GROUP_SIZE*G), but the per-point EC math runs on
-// AVX-512 IFMA. pts is caller-owned scratch of CPU_GROUP_SIZE Points, reused
-// across calls so there is no per-group allocation. The gen/hash fusion that
-// processGroupFused did gave 0% (compute-bound), so splitting them here is free.
+// Like genGroupIFMA, but writes each public key directly as a 33-byte compressed
+// SHA block (via to_compressed8 for the 8-lane bulk, storeCompScalar for the
+// tail) into the caller's pre-formatted CPU_GROUP_SIZE x 64 buffer -- no Point
+// round-trip, no GetBytes() in the hash phase. Index mapping matches genGroupIFMA
+// exactly. startP is advanced by CPU_GROUP_SIZE*G on return.
+static void genGroupIFMABlocks(Point &startP, Point *Gn, Point &_2Gn,
+                               std::vector<Int> &dx, IntGroup &grp, uint8_t *blocks) {
+    const int CENTER  = CPU_GROUP_SIZE / 2;
+    const int hLength = CENTER - 1;
+    int j;
+
+    for (j = 0; j < hLength; j++) dx[j].ModSub(&Gn[j].x, &startP.x);
+    dx[j].ModSub(&Gn[j].x, &startP.x);     // dx[hLength]
+    dx[j + 1].ModSub(&_2Gn.x, &startP.x);  // dx[CENTER] (for the advance)
+    grp.ModInv();
+
+    ifma::FieldVec8 SPX = ifma::broadcast(startP.x);
+    ifma::FieldVec8 SPY = ifma::broadcast(startP.y);
+    storeCompScalar(startP, blocks + (long)CENTER * 64);
+
+    Int gx[8], gy[8], iv[8];
+    for (j = 0; j + 8 <= hLength; j += 8) {
+        for (int l = 0; l < 8; l++) {
+            gx[l].Set(&Gn[j + l].x); gy[l].Set(&Gn[j + l].y); iv[l].Set(&dx[j + l]);
+        }
+        ifma::FieldVec8 GX = ifma::load8(gx), GY = ifma::load8(gy), IV = ifma::load8(iv);
+        ifma::FieldVec8 RX, RY;
+        ifma::gen8(SPX, SPY, GX, GY, IV, true,  RX, RY);
+        ifma::to_compressed8(RX, RY, blocks + (long)(CENTER + j + 1) * 64, 64, +1);
+        ifma::gen8(SPX, SPY, GX, GY, IV, false, RX, RY);
+        ifma::to_compressed8(RX, RY, blocks + (long)(CENTER - j - 1) * 64, 64, -1);
+    }
+
+    // Scalar tail (leftover j's, block 0, and the startP advance).
+    auto scalarPoint = [&](int gi, bool plus, Point &out) {
+        Int dyv, s, p2;
+        if (plus) dyv.ModSub(&Gn[gi].y, &startP.y);
+        else { dyv.Set(&Gn[gi].y); dyv.ModNeg(); dyv.ModSub(&startP.y); }
+        s.ModMulK1(&dyv, &dx[gi]);
+        p2.ModSquareK1(&s);
+        out.x.Set(&startP.x); out.x.ModNeg(); out.x.ModAdd(&p2); out.x.ModSub(&Gn[gi].x);
+        out.y.ModSub(&Gn[gi].x, &out.x); out.y.ModMulK1(&s);
+        if (plus) out.y.ModSub(&Gn[gi].y); else out.y.ModAdd(&Gn[gi].y);
+    };
+    Point tmp;
+    for (; j < hLength; j++) {
+        scalarPoint(j, true,  tmp); storeCompScalar(tmp, blocks + (long)(CENTER + j + 1) * 64);
+        scalarPoint(j, false, tmp); storeCompScalar(tmp, blocks + (long)(CENTER - j - 1) * 64);
+    }
+    scalarPoint(hLength, false, tmp); storeCompScalar(tmp, blocks + 0); // pubkey(base) -> block 0
+
+    Int dyv, s, p2; Point pp = startP;
+    dyv.ModSub(&_2Gn.y, &pp.y);
+    s.ModMulK1(&dyv, &dx[hLength + 1]);
+    p2.ModSquareK1(&s);
+    pp.x.ModNeg(); pp.x.ModAdd(&p2); pp.x.ModSub(&_2Gn.x);
+    pp.y.ModSub(&_2Gn.x, &pp.x); pp.y.ModMulK1(&s); pp.y.ModSub(&_2Gn.y);
+    startP = pp;
+}
+
+// Production IFMA search path: generate the whole 4096-point group straight into
+// compressed SHA blocks (genGroupIFMABlocks), then hash + compare each
+// HASH_BATCH_SIZE chunk in place. Same contract as processGroupFused (returns the
+// in-group index of the first match or -1, advances startP by CPU_GROUP_SIZE*G),
+// but the per-point EC math runs on AVX-512 IFMA and there is no Point round-trip.
+// blocks is caller-owned scratch (CPU_GROUP_SIZE*64 bytes), formatted once by
+// initBlocks and reused across calls.
 static int processGroupIFMA(Point &startP, Point *Gn, Point &_2Gn,
-                            std::vector<Int> &dx, IntGroup &grp, Point *pts,
+                            std::vector<Int> &dx, IntGroup &grp, uint8_t *blocks,
                             __m128i target16, const uint8_t *targetHash160) {
-    genGroupIFMA(startP, Gn, _2Gn, dx, grp, pts);
+    genGroupIFMABlocks(startP, Gn, _2Gn, dx, grp, blocks);
 
     ALIGN64 uint8_t hashRes[HASH_BATCH_SIZE][20];
     for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
-        computeHash160BatchBinSingle2(&pts[i], hashRes);
+        hash16Blocks(blocks + (long)i * 64, hashRes);
         for (int L = 0; L < HASH_BATCH_SIZE; L++) {
             __m128i cand = _mm_loadu_si128(reinterpret_cast<const __m128i *>(hashRes[L]));
             if (_mm_movemask_epi8(_mm_cmpeq_epi8(cand, target16)) == 0xFFFF &&
@@ -1152,10 +1269,11 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
                 sink += acc;
             }
         } else if (mode == BenchMode::FullIFMA) {
-            std::vector<Point> pts(CPU_GROUP_SIZE);
+            std::vector<uint8_t> blocks((size_t)CPU_GROUP_SIZE * 64);
+            initBlocks(blocks.data());
             for (long long b = 0; b < batchesPerThread; ++b) {
                 int idx = processGroupIFMA(startP, Gn.data(), _2Gn, dx, grp,
-                                           pts.data(), target16, dummy);
+                                           blocks.data(), target16, dummy);
                 if (idx >= 0) sink += 1; // never matches; keeps the work live
             }
         } else { // Full
@@ -1412,8 +1530,10 @@ int main(int argc, char* argv[])
         Point _2Gn;
         buildGeneratorTable(secp, Gn, _2Gn);
 
-        // Scratch for the IFMA group generator (reused every group, no realloc).
-        std::vector<Point> pts(CPU_GROUP_SIZE);
+        // SHA-block scratch for the IFMA generator (reused every group; the
+        // constant message padding is laid down once here).
+        std::vector<uint8_t> blocks((size_t)CPU_GROUP_SIZE * 64);
+        initBlocks(blocks.data());
 
         //#pragma omp critical
         {
@@ -1427,7 +1547,7 @@ int main(int argc, char* argv[])
         while (!matchFound) {
             if (priv.IsGreater((Int*)&threadRangeEnd)) break;
 
-            int idx = processGroupIFMA(startP, Gn, _2Gn, dx, grp, pts.data(),
+            int idx = processGroupIFMA(startP, Gn, _2Gn, dx, grp, blocks.data(),
                                        target16, targetHash160.data());
             if (idx >= 0) {
 #pragma omp critical(full_match)
