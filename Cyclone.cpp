@@ -636,23 +636,46 @@ static Int ifma_randFE() {
     v.bits64[0] = ifma_next_rand();
     v.bits64[1] = ifma_next_rand();
     v.bits64[2] = ifma_next_rand();
-    v.bits64[3] = ifma_next_rand();
-    v.Mod(&Int::P);
+    v.bits64[3] = ifma_next_rand() & 0x7FFFFFFFFFFFFFFFULL; // < 2^255 < p (no Mod needed)
     return v;
 }
 
-// Reconstruct value = sum limbs[k]*2^(52k) into an Int and reduce mod p. Valid
-// for redundant limbs (it is just the weighted positional sum).
+// Canonicalize redundant radix-2^52 limbs to a < p value, entirely in scalar
+// (carry -> fold 2^256==R -> conditional subtract p). Deliberately avoids
+// Int::ShiftL / Int::Mod so the checker is independent of those, and never feeds
+// a >= 2^256 value to Int (which only supports <=256-bit operands).
 static Int ifma_limbsToInt(const uint64_t limbs[5]) {
-    Int v; for (int i = 0; i < NB64BLOCK; i++) v.bits64[i] = 0;
-    Int t;
-    for (int k = 4; k >= 0; --k) {
-        v.ShiftL(52);
-        for (int i = 0; i < NB64BLOCK; i++) t.bits64[i] = 0;
-        t.bits64[0] = limbs[k];
-        v.Add(&t);
+    uint64_t n[5];
+    __uint128_t c = (__uint128_t)limbs[0];           n[0] = (uint64_t)c & ifma::MASK52; c >>= 52;
+    c += limbs[1];                                    n[1] = (uint64_t)c & ifma::MASK52; c >>= 52;
+    c += limbs[2];                                    n[2] = (uint64_t)c & ifma::MASK52; c >>= 52;
+    c += limbs[3];                                    n[3] = (uint64_t)c & ifma::MASK52; c >>= 52;
+    c += limbs[4];                                    n[4] = (uint64_t)c; // may exceed 48 bits
+
+    // Fold everything >= 2^256 back via R until the value is < 2^256.
+    while (n[4] >> 48) {
+        uint64_t over = n[4] >> 48; n[4] &= ifma::MASK48;
+        __uint128_t d = (__uint128_t)n[0] + (__uint128_t)over * ifma::R256;
+        n[0] = (uint64_t)d & ifma::MASK52; d >>= 52;
+        d += n[1]; n[1] = (uint64_t)d & ifma::MASK52; d >>= 52;
+        d += n[2]; n[2] = (uint64_t)d & ifma::MASK52; d >>= 52;
+        d += n[3]; n[3] = (uint64_t)d & ifma::MASK52; d >>= 52;
+        d += n[4]; n[4] = (uint64_t)d;
     }
-    v.Mod(&Int::P);
+
+    // Pack 5x52 -> 4x64 (value now < 2^256).
+    uint64_t w0 =  n[0]        | (n[1] << 52);
+    uint64_t w1 = (n[1] >> 12) | (n[2] << 40);
+    uint64_t w2 = (n[2] >> 24) | (n[3] << 28);
+    uint64_t w3 = (n[3] >> 36) | (n[4] << 16);
+
+    // Conditional subtract p. value < 2^256 < 2p, and [p, 2^256) is exactly the
+    // set with w1==w2==w3==~0 and w0 >= 0xFFFFFFFEFFFFFC2F, so one subtract suffices.
+    const uint64_t P0 = 0xFFFFFFFEFFFFFC2FULL, PHI = 0xFFFFFFFFFFFFFFFFULL;
+    if (w3 == PHI && w2 == PHI && w1 == PHI && w0 >= P0) { w0 -= P0; w1 = 0; w2 = 0; w3 = 0; }
+
+    Int v; for (int i = 0; i < NB64BLOCK; i++) v.bits64[i] = 0;
+    v.bits64[0] = w0; v.bits64[1] = w1; v.bits64[2] = w2; v.bits64[3] = w3;
     return v;
 }
 
