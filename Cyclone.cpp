@@ -977,7 +977,22 @@ static int runSelfTestIFMA() {
     }
 
     // gen8: 8-lane EC point add (base +/- G), validated against scalar AddDirect.
-    int fGenP = 0, fGenM = 0;
+    // fCompGen also cross-checks to_compressed8 on the SAME gen8 outputs (which
+    // hit reduce8's fold path) against the scalar ifma_limbsToInt + BE + parity.
+    int fGenP = 0, fGenM = 0, fCompGen = 0;
+    auto checkCompGen = [&](const ifma::FieldVec8 &RX, const ifma::FieldVec8 &RY,
+                            uint64_t ox[8][5], uint64_t oy[8][5]) {
+        uint8_t gotc[8][33];
+        ifma::to_compressed8(RX, RY, &gotc[0][0], 33, 1);
+        for (int k = 0; k < 8; k++) {
+            Int cx = ifma_limbsToInt(ox[k]), cy = ifma_limbsToInt(oy[k]);
+            uint8_t ref[33];
+            ref[0] = isEven(&cy) ? 0x02 : 0x03;
+            uint8_t *xb = cx.GetBytes();
+            for (int b2 = 0; b2 < 32; b2++) ref[1 + b2] = xb[31 - b2];
+            if (std::memcmp(gotc[k], ref, 33) != 0) fCompGen++;
+        }
+    };
     for (int b = 0; b < 500; b++) {
         Int kb; for (int i = 0; i < NB64BLOCK; i++) kb.bits64[i] = 0;
         kb.bits64[0] = ifma_next_rand() | 1ULL; kb.bits64[1] = ifma_next_rand();
@@ -1004,6 +1019,7 @@ static int runSelfTestIFMA() {
             Point e = secp.AddDirect(P, G[k]);
             if (!gotx.IsEqual(&e.x) || !goty.IsEqual(&e.y)) fGenP++;
         }
+        checkCompGen(RX, RY, ox, oy);
 
         ifma::gen8(SPX, SPY, GX, GY, INV, false, RX, RY);
         ifma::store8(RX, ox); ifma::store8(RY, oy);
@@ -1013,6 +1029,7 @@ static int runSelfTestIFMA() {
             Point e = secp.AddDirect(P, negG);
             if (!gotx.IsEqual(&e.x) || !goty.IsEqual(&e.y)) fGenM++;
         }
+        checkCompGen(RX, RY, ox, oy);
     }
 
     // genGroupIFMA: whole 4096-point group validated against ComputePublicKey.
@@ -1079,6 +1096,42 @@ static int runSelfTestIFMA() {
         checkComp(edge, edge);
     }
 
+    // Block path (genGroupIFMABlocks + hash16Blocks) vs Point path (genGroupIFMA
+    // + computeHash160BatchBinSingle2): compare final hash160 over a whole group.
+    // This is the exact production path -- a mismatch localizes the C.1c bug.
+    int fBlocks = 0;
+    {
+        std::vector<Point> Gn(CPU_GROUP_SIZE / 2); Point _2Gn;
+        buildGeneratorTable(secp, Gn.data(), _2Gn);
+        Int base; for (int i = 0; i < NB64BLOCK; i++) base.bits64[i] = 0;
+        base.bits64[0] = 0x100000ULL;
+        Int half; half.SetInt32(CPU_GROUP_SIZE / 2);
+        Int center; center.Set(&base); center.Add(&half);
+
+        Point startP1 = secp.ComputePublicKey(&center);
+        std::vector<Int> dx1(CPU_GROUP_SIZE / 2 + 1);
+        IntGroup grp1(CPU_GROUP_SIZE / 2 + 1); grp1.Set(dx1.data());
+        std::vector<Point> pts(CPU_GROUP_SIZE);
+        genGroupIFMA(startP1, Gn.data(), _2Gn, dx1, grp1, pts.data());
+        std::vector<uint8_t> hashA((size_t)CPU_GROUP_SIZE * 20);
+        ALIGN64 uint8_t hr[HASH_BATCH_SIZE][20];
+        for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
+            computeHash160BatchBinSingle2(&pts[i], hr);
+            for (int L = 0; L < HASH_BATCH_SIZE; L++) std::memcpy(&hashA[(size_t)(i + L) * 20], hr[L], 20);
+        }
+
+        Point startP2 = secp.ComputePublicKey(&center);
+        std::vector<Int> dx2(CPU_GROUP_SIZE / 2 + 1);
+        IntGroup grp2(CPU_GROUP_SIZE / 2 + 1); grp2.Set(dx2.data());
+        std::vector<uint8_t> blocks((size_t)CPU_GROUP_SIZE * 64); initBlocks(blocks.data());
+        genGroupIFMABlocks(startP2, Gn.data(), _2Gn, dx2, grp2, blocks.data());
+        for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
+            hash16Blocks(blocks.data() + (long)i * 64, hr);
+            for (int L = 0; L < HASH_BATCH_SIZE; L++)
+                if (std::memcmp(&hashA[(size_t)(i + L) * 20], hr[L], 20) != 0) fBlocks++;
+        }
+    }
+
     auto line = [](const char *name, int fails) {
         std::cout << name << " : " << (fails == 0 ? "OK" : "FAIL");
         if (fails) std::cout << " (" << fails << " mismatches)";
@@ -1094,10 +1147,13 @@ static int runSelfTestIFMA() {
     line("sqr (IFMA)           ", fSqr);
     line("gen8 plus            ", fGenP);
     line("gen8 minus           ", fGenM);
+    line("to_compressed8 (gen8)", fCompGen);
     line("genGroupIFMA         ", fGroup);
     line("to_compressed8       ", fComp);
+    line("block path vs point  ", fBlocks);
 
-    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr + fGenP + fGenM + fGroup + fComp;
+    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr
+                 + fGenP + fGenM + fCompGen + fGroup + fComp + fBlocks;
     std::cout << "================================================\n";
     std::cout << (failures == 0 ? "IFMA FIELD SELFTEST PASSED\n" : "IFMA FIELD SELFTEST FAILED\n");
     return failures == 0 ? 0 : 1;

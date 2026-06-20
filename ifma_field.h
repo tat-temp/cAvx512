@@ -282,31 +282,23 @@ static inline void to_compressed8(const FieldVec8 &rx, const FieldVec8 &ry,
     reduce8(rx, xW0, xW1, xW2, xW3);
     reduce8(ry, yW0, yW1, yW2, yW3);
 
-    // Reverse the 8 bytes within each 64-bit lane: stored LE, this yields BE bytes.
-    const __m512i BSWAP = _mm512_set_epi8(
-        8,9,10,11,12,13,14,15, 0,1,2,3,4,5,6,7,
-        8,9,10,11,12,13,14,15, 0,1,2,3,4,5,6,7,
-        8,9,10,11,12,13,14,15, 0,1,2,3,4,5,6,7,
-        8,9,10,11,12,13,14,15, 0,1,2,3,4,5,6,7);
-    __m512i b3 = _mm512_shuffle_epi8(xW3, BSWAP);
-    __m512i b2 = _mm512_shuffle_epi8(xW2, BSWAP);
-    __m512i b1 = _mm512_shuffle_epi8(xW1, BSWAP);
-    __m512i b0 = _mm512_shuffle_epi8(xW0, BSWAP);
-
-    uint64_t t3[8], t2[8], t1[8], t0[8], yy[8];
-    _mm512_storeu_si512((void *)t3, b3);
-    _mm512_storeu_si512((void *)t2, b2);
-    _mm512_storeu_si512((void *)t1, b1);
-    _mm512_storeu_si512((void *)t0, b0);
-    _mm512_storeu_si512((void *)yy, yW0);
+    uint64_t w0[8], w1[8], w2[8], w3[8], y0[8];
+    _mm512_storeu_si512((void *)w0, xW0);
+    _mm512_storeu_si512((void *)w1, xW1);
+    _mm512_storeu_si512((void *)w2, xW2);
+    _mm512_storeu_si512((void *)w3, xW3);
+    _mm512_storeu_si512((void *)y0, yW0);
 
     for (int l = 0; l < 8; l++) {
         uint8_t *d = base + (long)l * step * slotBytes;
-        d[0] = (uint8_t)(0x02 | (yy[l] & 1ULL));   // 0x02 even, 0x03 odd
-        std::memcpy(d + 1,  &t3[l], 8);            // x, most-significant word first
-        std::memcpy(d + 9,  &t2[l], 8);
-        std::memcpy(d + 17, &t1[l], 8);
-        std::memcpy(d + 25, &t0[l], 8);
+        d[0] = (uint8_t)(0x02 | (y0[l] & 1ULL));   // 0x02 even, 0x03 odd
+        // big-endian x = w3 : w2 : w1 : w0, each emitted most-significant byte first
+        const uint64_t W[4] = { w3[l], w2[l], w1[l], w0[l] };
+        for (int wi = 0; wi < 4; wi++) {
+            uint64_t v = W[wi];
+            for (int bi = 0; bi < 8; bi++)
+                d[1 + wi * 8 + bi] = (uint8_t)(v >> (56 - 8 * bi));
+        }
     }
 }
 
