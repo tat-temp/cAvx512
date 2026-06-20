@@ -25,6 +25,7 @@
 #include "Point.h"
 #include "Int.h"
 #include "IntGroup.h"
+#include "ifma_field.h"
 #include <cstdlib>
 
 // Reference (non-AVX512) helpers defined in p2pkh_decoder.cpp but not exposed in
@@ -614,6 +615,124 @@ static int runSelfTest(Secp256K1 &secp) {
     return failures == 0 ? 0 : 1;
 }
 
+//------------------------------------------------------------------------------
+// C.0a self-test: validate the SIMD radix-2^52 field foundation (Int<->limbs
+// conversion, SoA pack/unpack, add/sub/neg, normalize) against the scalar Int
+// field ops. No IFMA yet -- AVX-512F/DQ only. Run: --selftest-ifma
+//------------------------------------------------------------------------------
+static uint64_t ifma_rng_state = 0x0123456789ABCDEFULL;
+static inline uint64_t ifma_next_rand() {            // splitmix64 (deterministic)
+    ifma_rng_state += 0x9E3779B97F4A7C15ULL;
+    uint64_t z = ifma_rng_state;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+// A random field element in [0, p).
+static Int ifma_randFE() {
+    Int v;
+    for (int i = 0; i < NB64BLOCK; i++) v.bits64[i] = 0;
+    v.bits64[0] = ifma_next_rand();
+    v.bits64[1] = ifma_next_rand();
+    v.bits64[2] = ifma_next_rand();
+    v.bits64[3] = ifma_next_rand();
+    v.Mod(&Int::P);
+    return v;
+}
+
+// Reconstruct value = sum limbs[k]*2^(52k) into an Int and reduce mod p. Valid
+// for redundant limbs (it is just the weighted positional sum).
+static Int ifma_limbsToInt(const uint64_t limbs[5]) {
+    Int v; for (int i = 0; i < NB64BLOCK; i++) v.bits64[i] = 0;
+    Int t;
+    for (int k = 4; k >= 0; --k) {
+        v.ShiftL(52);
+        for (int i = 0; i < NB64BLOCK; i++) t.bits64[i] = 0;
+        t.bits64[0] = limbs[k];
+        v.Add(&t);
+    }
+    v.Mod(&Int::P);
+    return v;
+}
+
+static int runSelfTestIFMA() {
+    Secp256K1 secp; secp.Init();   // sets up Int::P (the secp256k1 field prime)
+
+    std::cout << "============== IFMA FIELD SELFTEST ==============\n";
+    const int BATCHES = 4000;      // 8 lanes -> 32k random vectors per op
+    int fRound = 0, fSoA = 0, fAdd = 0, fSub = 0, fNeg = 0, fNorm = 0;
+
+    for (int b = 0; b < BATCHES; b++) {
+        Int a[8], bb[8];
+        for (int j = 0; j < 8; j++) { a[j] = ifma_randFE(); bb[j] = ifma_randFE(); }
+
+        // 0) scalar conversion round-trip
+        for (int j = 0; j < 8; j++) {
+            uint64_t L[5]; ifma::int_to_limbs(a[j], L);
+            Int got = ifma_limbsToInt(L);
+            if (!got.IsEqual(&a[j])) fRound++;
+        }
+
+        ifma::FieldVec8 A = ifma::load8(a);
+        ifma::FieldVec8 B = ifma::load8(bb);
+
+        // 0b) SoA pack/unpack round-trip
+        uint64_t outA[8][5]; ifma::store8(A, outA);
+        for (int j = 0; j < 8; j++) {
+            Int got = ifma_limbsToInt(outA[j]);
+            if (!got.IsEqual(&a[j])) fSoA++;
+        }
+
+        uint64_t o[8][5];
+
+        ifma::FieldVec8 C = ifma::add(A, B); ifma::store8(C, o);
+        for (int j = 0; j < 8; j++) {
+            Int got = ifma_limbsToInt(o[j]);
+            Int exp; exp.Set(&a[j]); exp.ModAdd(&bb[j]);
+            if (!got.IsEqual(&exp)) fAdd++;
+        }
+
+        C = ifma::sub(A, B); ifma::store8(C, o);
+        for (int j = 0; j < 8; j++) {
+            Int got = ifma_limbsToInt(o[j]);
+            Int exp; exp.Set(&a[j]); exp.ModSub(&bb[j]);
+            if (!got.IsEqual(&exp)) fSub++;
+        }
+
+        C = ifma::neg(A); ifma::store8(C, o);
+        for (int j = 0; j < 8; j++) {
+            Int got = ifma_limbsToInt(o[j]);
+            Int exp; exp.Set(&a[j]); exp.ModNeg();
+            if (!got.IsEqual(&exp)) fNeg++;
+        }
+
+        C = ifma::add(A, B); ifma::normalize_weak(C); ifma::store8(C, o);
+        for (int j = 0; j < 8; j++) {
+            Int got = ifma_limbsToInt(o[j]);
+            Int exp; exp.Set(&a[j]); exp.ModAdd(&bb[j]);
+            if (!got.IsEqual(&exp)) fNorm++;
+        }
+    }
+
+    auto line = [](const char *name, int fails) {
+        std::cout << name << " : " << (fails == 0 ? "OK" : "FAIL");
+        if (fails) std::cout << " (" << fails << " mismatches)";
+        std::cout << "\n";
+    };
+    line("conversion round-trip", fRound);
+    line("SoA pack/unpack      ", fSoA);
+    line("add                  ", fAdd);
+    line("sub                  ", fSub);
+    line("neg                  ", fNeg);
+    line("normalize            ", fNorm);
+
+    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm;
+    std::cout << "================================================\n";
+    std::cout << (failures == 0 ? "IFMA FIELD SELFTEST PASSED\n" : "IFMA FIELD SELFTEST FAILED\n");
+    return failures == 0 ? 0 : 1;
+}
+
 // Point generation ONLY (no hashing) -- for --bench-gen, to attribute time
 // between the scalar EC math and the AVX-512 hashing. Mirrors processGroupFused's
 // generation exactly, but instead of hashing returns a checksum of the generated
@@ -808,6 +927,7 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
 static void printUsage(const char* programName) {
     std::cerr << "Usage: " << programName << " -a <Base58_P2PKH> -r <START:END>\n";
     std::cerr << "       " << programName << " --selftest            (correctness checks)\n";
+    std::cerr << "       " << programName << " --selftest-ifma       (SIMD field-arith checks)\n";
     std::cerr << "       " << programName << " --bench [batches] [threads]       (full gen+hash)\n";
     std::cerr << "       " << programName << " --bench-gen [batches] [threads]   (point-gen only)\n";
     std::cerr << "       " << programName << " --bench-hash [batches] [threads]  (hash160 only)\n";
@@ -865,6 +985,9 @@ int main(int argc, char* argv[])
         if (!std::strcmp(argv[i], "--selftest")) {
             Secp256K1 secp; secp.Init();
             return runSelfTest(secp);
+        }
+        if (!std::strcmp(argv[i], "--selftest-ifma")) {
+            return runSelfTestIFMA();
         }
         if (!std::strcmp(argv[i], "--bench") ||
             !std::strcmp(argv[i], "--bench-gen") ||
