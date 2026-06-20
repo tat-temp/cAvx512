@@ -373,11 +373,9 @@ static void computeHash160BatchBinSingle2(
 //------------------------------------------------------------------------------
 // Phase 0 instrumentation: shared building blocks for --bench and --selftest.
 //
-// NOTE: generateGroupPoints mirrors the point-generation block inside main()'s
-// search loop verbatim. It is duplicated here (rather than refactored out of the
-// production hot loop) so this Phase-0 harness cannot perturb the real search
-// path while it is unverified. Phase 2 (fuse generation with hashing) will unify
-// the two copies; --selftest is what guards that change.
+// processGroupFused (below) is the single generate+hash+compare routine shared by
+// the production search loop, --selftest, and --bench, so the harness exercises
+// the exact hot path that runs in production.
 //------------------------------------------------------------------------------
 static void buildGeneratorTable(Secp256K1 &secp, Point *Gn, Point &_2Gn) {
     Point g = secp.G;
@@ -391,74 +389,94 @@ static void buildGeneratorTable(Secp256K1 &secp, Point *Gn, Point &_2Gn) {
     _2Gn = secp.DoubleDirect(Gn[CPU_GROUP_SIZE / 2 - 1]);
 }
 
-// Fill pts[0..CPU_GROUP_SIZE-1] with the public keys for the consecutive private
-// keys [k, k+CPU_GROUP_SIZE-1], where startP on entry is the public key of
-// (k + CPU_GROUP_SIZE/2). startP is advanced by CPU_GROUP_SIZE*G on return.
-// dx must hold CPU_GROUP_SIZE/2+1 entries and grp must already be Set() to it.
-static void generateGroupPoints(Point &startP, Point *Gn, Point &_2Gn,
-                                std::vector<Int> &dx, IntGroup &grp, Point *pts) {
-    const int hLength = (CPU_GROUP_SIZE / 2 - 1);
+// Generate the CPU_GROUP_SIZE public keys for consecutive private keys
+// [base, base+CPU_GROUP_SIZE), where startP on entry is the public key of
+// (base + CPU_GROUP_SIZE/2), and hash each HASH_BATCH_SIZE-sized chunk to hash160
+// immediately -- "fused", so the working set is one 16-point chunk (L1-resident)
+// instead of a 4096-point array. Each candidate is compared against target16
+// (first 16 bytes) then the full 20-byte targetHash160. Returns the in-group
+// index [0, CPU_GROUP_SIZE) of the first match, or -1 if none. startP is advanced
+// by CPU_GROUP_SIZE*G on return (using dx[CENTER], computed before inversion from
+// the OLD startP). dx must hold CPU_GROUP_SIZE/2+1 entries; grp must be Set() to it.
+//
+// The per-index point math is identical to the original two-pass generator:
+//   idx == CENTER : startP
+//   idx >  CENTER : startP + m*G  (m = idx-CENTER), via Gn[m-1], dx[m-1]
+//   idx <  CENTER : startP - m*G  (m = CENTER-idx), via Gn[m-1], dx[m-1]
+static int processGroupFused(Point &startP, Point *Gn, Point &_2Gn,
+                             std::vector<Int> &dx, IntGroup &grp,
+                             __m128i target16, const uint8_t *targetHash160) {
+    const int CENTER  = CPU_GROUP_SIZE / 2;
+    const int hLength = CENTER - 1;
     Int dy, dyn, _s, _p;
-    Point pp, pn;
     int j;
 
+    // 1. Batch all (Gn[j].x - startP.x) differences, then invert the whole group.
     for (j = 0; j < hLength; j++) {
         dx[j].ModSub(&Gn[j].x, &startP.x);
     }
-    dx[j].ModSub(&Gn[j].x, &startP.x);
-    dx[j + 1].ModSub(&_2Gn.x, &startP.x);
-
+    dx[j].ModSub(&Gn[j].x, &startP.x);     // dx[CENTER-1]
+    dx[j + 1].ModSub(&_2Gn.x, &startP.x);  // dx[CENTER]  (for the next center point)
     grp.ModInv();
 
-    pts[CPU_GROUP_SIZE / 2] = startP;
+    // 2. Generate + hash one HASH_BATCH_SIZE chunk at a time.
+    Point chunk[HASH_BATCH_SIZE];
+    ALIGN64 uint8_t hashRes[HASH_BATCH_SIZE][20];
+    int foundIdx = -1;
 
-    for (j = 0; j < hLength; j++) {
-        pp = startP;
-        pn = startP;
+    for (int i = 0; i < CPU_GROUP_SIZE && foundIdx < 0; i += HASH_BATCH_SIZE) {
+        for (int L = 0; L < HASH_BATCH_SIZE; L++) {
+            const int idx = i + L;
+            Point &out = chunk[L];
+            if (idx == CENTER) {
+                out = startP;
+                continue;
+            }
+            if (idx > CENTER) {                 // startP + m*G
+                const int m = idx - CENTER;
+                dy.ModSub(&Gn[m - 1].y, &startP.y);
+                _s.ModMulK1(&dy, &dx[m - 1]);
+                _p.ModSquareK1(&_s);
+                out.x.Set(&startP.x);
+                out.x.ModNeg();
+                out.x.ModAdd(&_p);
+                out.x.ModSub(&Gn[m - 1].x);
+                out.y.ModSub(&Gn[m - 1].x, &out.x);
+                out.y.ModMulK1(&_s);
+                out.y.ModSub(&Gn[m - 1].y);
+            } else {                            // startP - m*G  ( -G = (x, -y) )
+                const int m = CENTER - idx;
+                dyn.Set(&Gn[m - 1].y);
+                dyn.ModNeg();
+                dyn.ModSub(&startP.y);
+                _s.ModMulK1(&dyn, &dx[m - 1]);
+                _p.ModSquareK1(&_s);
+                out.x.Set(&startP.x);
+                out.x.ModNeg();
+                out.x.ModAdd(&_p);
+                out.x.ModSub(&Gn[m - 1].x);
+                out.y.ModSub(&Gn[m - 1].x, &out.x);
+                out.y.ModMulK1(&_s);
+                out.y.ModAdd(&Gn[m - 1].y);
+            }
+        }
 
-        dy.ModSub(&Gn[j].y, &pp.y);
-        _s.ModMulK1(&dy, &dx[j]);
-        _p.ModSquareK1(&_s);
-        pp.x.ModNeg();
-        pp.x.ModAdd(&_p);
-        pp.x.ModSub(&Gn[j].x);
-        pp.y.ModSub(&Gn[j].x, &pp.x);
-        pp.y.ModMulK1(&_s);
-        pp.y.ModSub(&Gn[j].y);
+        computeHash160BatchBinSingle2(chunk, hashRes);
 
-        dyn.Set(&Gn[j].y);
-        dyn.ModNeg();
-        dyn.ModSub(&pn.y);
-        _s.ModMulK1(&dyn, &dx[j]);
-        _p.ModSquareK1(&_s);
-        pn.x.ModNeg();
-        pn.x.ModAdd(&_p);
-        pn.x.ModSub(&Gn[j].x);
-        pn.y.ModSub(&Gn[j].x, &pn.x);
-        pn.y.ModMulK1(&_s);
-        pn.y.ModAdd(&Gn[j].y);
-
-        pts[CPU_GROUP_SIZE / 2 + (j + 1)] = pp;
-        pts[CPU_GROUP_SIZE / 2 - (j + 1)] = pn;
+        for (int L = 0; L < HASH_BATCH_SIZE; L++) {
+            __m128i cand = _mm_loadu_si128(reinterpret_cast<const __m128i *>(hashRes[L]));
+            if (_mm_movemask_epi8(_mm_cmpeq_epi8(cand, target16)) == 0xFFFF &&
+                std::memcmp(hashRes[L], targetHash160, 20) == 0) {
+                foundIdx = i + L;
+                break;
+            }
+        }
     }
 
-    pn = startP;
-    dyn.Set(&Gn[j].y);
-    dyn.ModNeg();
-    dyn.ModSub(&pn.y);
-    _s.ModMulK1(&dyn, &dx[j]);
-    _p.ModSquareK1(&_s);
-    pn.x.ModNeg();
-    pn.x.ModAdd(&_p);
-    pn.x.ModSub(&Gn[j].x);
-    pn.y.ModSub(&Gn[j].x, &pn.x);
-    pn.y.ModMulK1(&_s);
-    pn.y.ModAdd(&Gn[j].y);
-    pts[0] = pn;
-
-    pp = startP;
+    // 3. Advance startP by CPU_GROUP_SIZE*G (reads the OLD startP via dx[CENTER]).
+    Point pp = startP;
     dy.ModSub(&_2Gn.y, &pp.y);
-    _s.ModMulK1(&dy, &dx[j + 1]);
+    _s.ModMulK1(&dy, &dx[hLength + 1]);
     _p.ModSquareK1(&_s);
     pp.x.ModNeg();
     pp.x.ModAdd(&_p);
@@ -467,6 +485,8 @@ static void generateGroupPoints(Point &startP, Point *Gn, Point &_2Gn,
     pp.y.ModMulK1(&_s);
     pp.y.ModSub(&_2Gn.y);
     startP = pp;
+
+    return foundIdx;
 }
 
 // Build a mainnet P2PKH Base58Check address from a 20-byte hash160.
@@ -562,31 +582,20 @@ static int runSelfTest(Secp256K1 &secp) {
     std::vector<Int> dx(CPU_GROUP_SIZE / 2 + 1);
     IntGroup grp(CPU_GROUP_SIZE / 2 + 1);
     grp.Set(dx.data());
-    std::vector<Point> pts(CPU_GROUP_SIZE);
-    ALIGN64 uint8_t hashRes[HASH_BATCH_SIZE][20];
     __m128i target16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(targetH.data()));
 
     bool found = false;
     std::string foundPrivHex, foundWif;
     while (!found) {
         if (priv.IsGreater(&endK)) break;
-        generateGroupPoints(startP, Gn.data(), _2Gn, dx, grp, pts.data());
-        for (int i = 0; i < CPU_GROUP_SIZE && !found; i += HASH_BATCH_SIZE) {
-            computeHash160BatchBinSingle2(pts.data() + i, hashRes);
-            for (int j = 0; j < HASH_BATCH_SIZE; ++j) {
-                __m128i cand = _mm_loadu_si128(reinterpret_cast<const __m128i *>(hashRes[j]));
-                if (_mm_movemask_epi8(_mm_cmpeq_epi8(cand, target16)) == 0xFFFF &&
-                    std::memcmp(hashRes[j], targetH.data(), 20) == 0) {
-                    const int idx = i + j;
-                    Int mPriv; mPriv.Set(&priv);
-                    Int off;   off.SetInt32((uint32_t)idx);
-                    mPriv.Add(&off);
-                    foundPrivHex = padHexTo64(intToHex(mPriv));
-                    foundWif = P2PKHDecoder::compute_wif(foundPrivHex, true);
-                    found = true;
-                    break;
-                }
-            }
+        int idx = processGroupFused(startP, Gn.data(), _2Gn, dx, grp, target16, targetH.data());
+        if (idx >= 0) {
+            Int mPriv; mPriv.Set(&priv);
+            Int off;   off.SetInt32((uint32_t)idx);
+            mPriv.Add(&off);
+            foundPrivHex = padHexTo64(intToHex(mPriv));
+            foundWif = P2PKHDecoder::compute_wif(foundPrivHex, true);
+            found = true;
         }
         priv.Add((uint64_t)CPU_GROUP_SIZE);
     }
@@ -640,19 +649,10 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
         std::vector<Int> dx(CPU_GROUP_SIZE / 2 + 1);
         IntGroup grp(CPU_GROUP_SIZE / 2 + 1);
         grp.Set(dx.data());
-        std::vector<Point> pts(CPU_GROUP_SIZE);
-        ALIGN64 uint8_t hashRes[HASH_BATCH_SIZE][20];
 
         for (long long b = 0; b < batchesPerThread; ++b) {
-            generateGroupPoints(startP, Gn.data(), _2Gn, dx, grp, pts.data());
-            for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
-                computeHash160BatchBinSingle2(pts.data() + i, hashRes);
-                for (int j = 0; j < HASH_BATCH_SIZE; ++j) {
-                    __m128i cand = _mm_loadu_si128(reinterpret_cast<const __m128i *>(hashRes[j]));
-                    sink += (unsigned long long)hashRes[j][0];
-                    if (_mm_movemask_epi8(_mm_cmpeq_epi8(cand, target16)) == 0xFFFF) sink += 1;
-                }
-            }
+            int idx = processGroupFused(startP, Gn.data(), _2Gn, dx, grp, target16, dummy);
+            if (idx >= 0) sink += 1; // never matches; keeps the hashing live
         }
     }
 
@@ -846,7 +846,6 @@ int main(int argc, char* argv[])
 
     bool matchFound            = false;
     std::string foundPrivateKeyHex, foundPublicKeyHex, foundWIF;
-    const int hLength = (CPU_GROUP_SIZE / 2 - 1);
 
     Secp256K1 secp;
     secp.Init();
@@ -870,168 +869,41 @@ int main(int argc, char* argv[])
 
         std::vector<Int> dx(CPU_GROUP_SIZE / 2 + 1);
         IntGroup grp(CPU_GROUP_SIZE / 2 + 1);
-        Point pts[CPU_GROUP_SIZE];
-
         grp.Set(dx.data());
-
-        Int dy;
-        Int dyn;
-        Int _s;
-        Int _p;
-        Point pp;
-        Point pn;
 
         Point Gn[CPU_GROUP_SIZE / 2];
         Point _2Gn;
-
-        // Compute Generator table G[n] = (n+1)*G
-        Point g = secp.G;
-        Gn[0] = g;
-        g = secp.DoubleDirect(g);
-        Gn[1] = g;
-        for (int i = 2; i < CPU_GROUP_SIZE / 2; i++) {
-            g = secp.AddDirect(g, secp.G);
-            Gn[i] = g;
-        }
-        // _2Gn = CPU_GRP_SIZE*G
-        _2Gn = secp.DoubleDirect(Gn[CPU_GROUP_SIZE / 2 - 1]);
-
-        ALIGN64 uint8_t hashRes[HASH_BATCH_SIZE][20];
+        buildGeneratorTable(secp, Gn, _2Gn);
 
         //#pragma omp critical
         {
             g_threadPrivateKeys[threadId].Set((Int*)&priv);
         }
 
-        // Download the target (hash160) в __m128i for fast compare
+        // Target hash160: first 16 bytes preloaded for the fast SIMD pre-compare.
         __m128i target16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(targetHash160.data()));
 
         // main
         while (!matchFound) {
             if (priv.IsGreater((Int*)&threadRangeEnd)) break;
 
-            int j;
-
-            for (j = 0; j < hLength; j++) {
-                dx[j].ModSub(&Gn[j].x, &startP.x);
-            }
-            dx[j].ModSub(&Gn[j].x, &startP.x);  // For the first point
-            dx[j + 1].ModSub(&_2Gn.x, &startP.x); // For the next center point
-
-            grp.ModInv();
-
-            pts[CPU_GROUP_SIZE / 2] = startP;
-
-            for (j = 0; j < hLength; j++) {
-                pp = startP;
-                pn = startP;
-
-                // P = startP + i*G
-                dy.ModSub(&Gn[j].y, &pp.y);
-
-                _s.ModMulK1(&dy, &dx[j]);       // s = (p2.y-p1.y)*inverse(p2.x-p1.x);
-                _p.ModSquareK1(&_s);            // _p = pow2(s)
-
-                pp.x.ModNeg();
-                pp.x.ModAdd(&_p);
-                pp.x.ModSub(&Gn[j].x);           // rx = pow2(s) - p1.x - p2.x;
-
-                pp.y.ModSub(&Gn[j].x, &pp.x);
-                pp.y.ModMulK1(&_s);
-                pp.y.ModSub(&Gn[j].y);           // ry = - p2.y - s*(ret.x-p2.x);
-
-                // P = startP - i*G  , if (x,y) = i*G then (x,-y) = -i*G
-                dyn.Set(&Gn[j].y);
-                dyn.ModNeg();
-                dyn.ModSub(&pn.y);
-
-                _s.ModMulK1(&dyn, &dx[j]);      // s = (p2.y-p1.y)*inverse(p2.x-p1.x);
-                _p.ModSquareK1(&_s);            // _p = pow2(s)
-
-                pn.x.ModNeg();
-                pn.x.ModAdd(&_p);
-                pn.x.ModSub(&Gn[j].x);          // rx = pow2(s) - p1.x - p2.x;
-
-                pn.y.ModSub(&Gn[j].x, &pn.x);
-                pn.y.ModMulK1(&_s);
-                pn.y.ModAdd(&Gn[j].y);          // ry = - p2.y - s*(ret.x-p2.x);
-
-                pts[CPU_GROUP_SIZE / 2 + (j + 1)] = pp;
-                pts[CPU_GROUP_SIZE / 2 - (j + 1)] = pn;
-            }
-
-            // First point (startP - (GRP_SZIE/2)*G)
-            pn = startP;
-            dyn.Set(&Gn[j].y);
-            dyn.ModNeg();
-            dyn.ModSub(&pn.y);
-
-            _s.ModMulK1(&dyn, &dx[j]);
-            _p.ModSquareK1(&_s);
-
-            pn.x.ModNeg();
-            pn.x.ModAdd(&_p);
-            pn.x.ModSub(&Gn[j].x);
-
-            pn.y.ModSub(&Gn[j].x, &pn.x);
-            pn.y.ModMulK1(&_s);
-            pn.y.ModAdd(&Gn[j].y);
-
-            pts[0] = pn;
-
-            // Next start point (startP + GRP_SIZE*G)
-            pp = startP;
-            dy.ModSub(&_2Gn.y, &pp.y);
-
-            _s.ModMulK1(&dy, &dx[j + 1]);
-            _p.ModSquareK1(&_s);
-
-            pp.x.ModNeg();
-            pp.x.ModAdd(&_p);
-            pp.x.ModSub(&_2Gn.x);
-
-            pp.y.ModSub(&_2Gn.x, &pp.x);
-            pp.y.ModMulK1(&_s);
-            pp.y.ModSub(&_2Gn.y);
-            startP = pp;
-
-            for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
-                computeHash160BatchBinSingle2(
-                    ((Point*)&pts) + i,
-                    hashRes);
-
-                // Results check
-                for (int j = 0; j < HASH_BATCH_SIZE; j++) {
-                    /*{
-                        Int i;
-                        i.Set32Bytes(hashRes[j]);
-                        std::cout << "0 " << padHexTo64(intToHex(i)) << "\n";
-                    }*/
-
-                    __m128i cand16 = _mm_load_si128(reinterpret_cast<const __m128i*>(hashRes[j]));
-                    __m128i cmp = _mm_cmpeq_epi8(cand16, target16);
-                    if (_mm_movemask_epi8(cmp) == 0xFFFF) {
-                        // Checking last 4 bytes (20 - 16)
-                        if (std::memcmp(hashRes[j], targetHash160.data(), 20) == 0) {
+            int idx = processGroupFused(startP, Gn, _2Gn, dx, grp, target16, targetHash160.data());
+            if (idx >= 0) {
 #pragma omp critical(full_match)
-                            {
-                                if (!matchFound) {
-                                    matchFound = true;
-                                    Int mPriv = priv;
-                                    int idx = i + j;
+                {
+                    if (!matchFound) {
+                        matchFound = true;
+                        Int mPriv = priv;
+                        Int off; off.SetInt32(idx);
+                        mPriv.Add(&off);
 
-                                    Int off; off.SetInt32(idx);
-                                    mPriv.Add(&off);
-
-                                    foundPrivateKeyHex = padHexTo64(intToHex(mPriv));
-                                    foundPublicKeyHex = pointToCompressedHex(pts[idx]);
-                                    foundWIF = P2PKHDecoder::compute_wif(foundPrivateKeyHex, true);
-                                }
-                            }
-#pragma omp cancel parallel
-                        }
+                        foundPrivateKeyHex = padHexTo64(intToHex(mPriv));
+                        Point fp = secp.ComputePublicKey(&mPriv);
+                        foundPublicKeyHex = pointToCompressedHex(fp);
+                        foundWIF = P2PKHDecoder::compute_wif(foundPrivateKeyHex, true);
                     }
                 }
+#pragma omp cancel parallel
             }
 
             {
