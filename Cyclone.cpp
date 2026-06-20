@@ -679,6 +679,77 @@ static Int ifma_limbsToInt(const uint64_t limbs[5]) {
     return v;
 }
 
+// Scatter 8 lane results (rx,ry) into 8 Points at base, base+step, ... base+7*step.
+static inline void storePts8(const ifma::FieldVec8 &rx, const ifma::FieldVec8 &ry,
+                             Point *base, int step) {
+    uint64_t ox[8][5], oy[8][5];
+    ifma::store8(rx, ox);
+    ifma::store8(ry, oy);
+    for (int l = 0; l < 8; l++) {
+        Point *d = base + (long)l * step;
+        d->x = ifma_limbsToInt(ox[l]);
+        d->y = ifma_limbsToInt(oy[l]);
+    }
+}
+
+// IFMA group generator: fill pts[0..CPU_GROUP_SIZE-1] with pubkeys for the keys
+// [base, base+CPU_GROUP_SIZE) (startP on entry = pubkey of base+CENTER), using
+// gen8 (8 plus + 8 minus per batch) for the bulk and scalar for the tail. dx is
+// computed+inverted here; startP is advanced by CPU_GROUP_SIZE*G on return.
+static void genGroupIFMA(Point &startP, Point *Gn, Point &_2Gn,
+                         std::vector<Int> &dx, IntGroup &grp, Point *pts) {
+    const int CENTER  = CPU_GROUP_SIZE / 2;
+    const int hLength = CENTER - 1;
+    int j;
+
+    for (j = 0; j < hLength; j++) dx[j].ModSub(&Gn[j].x, &startP.x);
+    dx[j].ModSub(&Gn[j].x, &startP.x);     // dx[hLength]
+    dx[j + 1].ModSub(&_2Gn.x, &startP.x);  // dx[CENTER] (for the advance)
+    grp.ModInv();
+
+    ifma::FieldVec8 SPX = ifma::broadcast(startP.x);
+    ifma::FieldVec8 SPY = ifma::broadcast(startP.y);
+    pts[CENTER] = startP;
+
+    Int gx[8], gy[8], iv[8];
+    for (j = 0; j + 8 <= hLength; j += 8) {
+        for (int l = 0; l < 8; l++) {
+            gx[l].Set(&Gn[j + l].x); gy[l].Set(&Gn[j + l].y); iv[l].Set(&dx[j + l]);
+        }
+        ifma::FieldVec8 GX = ifma::load8(gx), GY = ifma::load8(gy), IV = ifma::load8(iv);
+        ifma::FieldVec8 RX, RY;
+        ifma::gen8(SPX, SPY, GX, GY, IV, true,  RX, RY);
+        storePts8(RX, RY, &pts[CENTER + j + 1], +1);     // pts[CENTER+j+1 .. +8]
+        ifma::gen8(SPX, SPY, GX, GY, IV, false, RX, RY);
+        storePts8(RX, RY, &pts[CENTER - j - 1], -1);     // pts[CENTER-j-1 .. -8]
+    }
+
+    // Scalar tail (leftover j's, pts[0], and the startP advance).
+    auto scalarPoint = [&](int gi, bool plus, Point &out) {
+        Int dyv, s, p2;
+        if (plus) dyv.ModSub(&Gn[gi].y, &startP.y);
+        else { dyv.Set(&Gn[gi].y); dyv.ModNeg(); dyv.ModSub(&startP.y); }
+        s.ModMulK1(&dyv, &dx[gi]);
+        p2.ModSquareK1(&s);
+        out.x.Set(&startP.x); out.x.ModNeg(); out.x.ModAdd(&p2); out.x.ModSub(&Gn[gi].x);
+        out.y.ModSub(&Gn[gi].x, &out.x); out.y.ModMulK1(&s);
+        if (plus) out.y.ModSub(&Gn[gi].y); else out.y.ModAdd(&Gn[gi].y);
+    };
+    for (; j < hLength; j++) {
+        scalarPoint(j, true,  pts[CENTER + j + 1]);
+        scalarPoint(j, false, pts[CENTER - j - 1]);
+    }
+    scalarPoint(hLength, false, pts[0]);  // startP - Gn[hLength] == pubkey(base)
+
+    Int dyv, s, p2; Point pp = startP;
+    dyv.ModSub(&_2Gn.y, &pp.y);
+    s.ModMulK1(&dyv, &dx[hLength + 1]);
+    p2.ModSquareK1(&s);
+    pp.x.ModNeg(); pp.x.ModAdd(&p2); pp.x.ModSub(&_2Gn.x);
+    pp.y.ModSub(&_2Gn.x, &pp.x); pp.y.ModMulK1(&s); pp.y.ModSub(&_2Gn.y);
+    startP = pp;
+}
+
 static int runSelfTestIFMA() {
     Secp256K1 secp; secp.Init();   // sets up Int::P (the secp256k1 field prime)
 
@@ -791,6 +862,27 @@ static int runSelfTestIFMA() {
         }
     }
 
+    // genGroupIFMA: whole 4096-point group validated against ComputePublicKey.
+    int fGroup = 0;
+    {
+        std::vector<Point> Gn(CPU_GROUP_SIZE / 2); Point _2Gn;
+        buildGeneratorTable(secp, Gn.data(), _2Gn);
+        Int base; for (int i = 0; i < NB64BLOCK; i++) base.bits64[i] = 0;
+        base.bits64[0] = 0x100000ULL;
+        Int half; half.SetInt32(CPU_GROUP_SIZE / 2);
+        Int center; center.Set(&base); center.Add(&half);
+        Point startP = secp.ComputePublicKey(&center);
+        std::vector<Int> dx(CPU_GROUP_SIZE / 2 + 1);
+        IntGroup grp(CPU_GROUP_SIZE / 2 + 1); grp.Set(dx.data());
+        std::vector<Point> pts(CPU_GROUP_SIZE);
+        genGroupIFMA(startP, Gn.data(), _2Gn, dx, grp, pts.data());
+        for (int idx = 0; idx < CPU_GROUP_SIZE; idx++) {
+            Int k; k.Set(&base); Int off; off.SetInt32((uint32_t)idx); k.Add(&off);
+            Point e = secp.ComputePublicKey(&k);
+            if (!pts[idx].x.IsEqual(&e.x) || !pts[idx].y.IsEqual(&e.y)) fGroup++;
+        }
+    }
+
     auto line = [](const char *name, int fails) {
         std::cout << name << " : " << (fails == 0 ? "OK" : "FAIL");
         if (fails) std::cout << " (" << fails << " mismatches)";
@@ -806,8 +898,9 @@ static int runSelfTestIFMA() {
     line("sqr (IFMA)           ", fSqr);
     line("gen8 plus            ", fGenP);
     line("gen8 minus           ", fGenM);
+    line("genGroupIFMA         ", fGroup);
 
-    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr + fGenP + fGenM;
+    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr + fGenP + fGenM + fGroup;
     std::cout << "================================================\n";
     std::cout << (failures == 0 ? "IFMA FIELD SELFTEST PASSED\n" : "IFMA FIELD SELFTEST FAILED\n");
     return failures == 0 ? 0 : 1;
@@ -890,7 +983,7 @@ static uint64_t processGroupGenOnly(Point &startP, Point *Gn, Point &_2Gn,
     return sink;
 }
 
-enum class BenchMode { Full, Gen, Hash, Inv };
+enum class BenchMode { Full, Gen, Hash, Inv, GenIFMA };
 
 //------------------------------------------------------------------------------
 // 0.1 Benchmark mode: run a fixed number of batches/thread with no I/O and no
@@ -957,6 +1050,12 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
             for (long long b = 0; b < batchesPerThread; ++b) {
                 sink += processGroupGenOnly(startP, Gn.data(), _2Gn, dx, grp);
             }
+        } else if (mode == BenchMode::GenIFMA) {
+            std::vector<Point> pts(CPU_GROUP_SIZE);
+            for (long long b = 0; b < batchesPerThread; ++b) {
+                genGroupIFMA(startP, Gn.data(), _2Gn, dx, grp, pts.data());
+                sink += pts[0].x.bits64[0] ^ pts[CPU_GROUP_SIZE - 1].y.bits64[0];
+            }
         } else if (mode == BenchMode::Inv) {
             // Batch inversion (+ its dx setup) only. ModInv overwrites dx in place,
             // so refill the differences each iteration, invert, then consume them.
@@ -985,10 +1084,11 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
     const unsigned long long totalKeys =
         (unsigned long long)threads * (unsigned long long)batchesPerThread * CPU_GROUP_SIZE;
     const double mkeys = secs > 0.0 ? (totalKeys / secs / 1e6) : 0.0;
-    const char *modeName = mode == BenchMode::Gen  ? "GEN  (point-gen only)"
-                         : mode == BenchMode::Hash ? "HASH (hash160 only)"
-                         : mode == BenchMode::Inv  ? "INV  (batch inversion only)"
-                                                   : "FULL (gen + hash)";
+    const char *modeName = mode == BenchMode::Gen     ? "GEN  (scalar point-gen only)"
+                         : mode == BenchMode::GenIFMA ? "GEN-IFMA (8-lane point-gen only)"
+                         : mode == BenchMode::Hash    ? "HASH (hash160 only)"
+                         : mode == BenchMode::Inv     ? "INV  (batch inversion only)"
+                                                      : "FULL (gen + hash)";
 
     std::cout << "================= BENCHMARK =================\n";
     std::cout << "Mode             : " << modeName << "\n";
@@ -1009,7 +1109,8 @@ static void printUsage(const char* programName) {
     std::cerr << "       " << programName << " --selftest            (correctness checks)\n";
     std::cerr << "       " << programName << " --selftest-ifma       (SIMD field-arith checks)\n";
     std::cerr << "       " << programName << " --bench [batches] [threads]       (full gen+hash)\n";
-    std::cerr << "       " << programName << " --bench-gen [batches] [threads]   (point-gen only)\n";
+    std::cerr << "       " << programName << " --bench-gen [batches] [threads]   (scalar point-gen)\n";
+    std::cerr << "       " << programName << " --bench-gen-ifma [batches] [thr]  (8-lane point-gen)\n";
     std::cerr << "       " << programName << " --bench-hash [batches] [threads]  (hash160 only)\n";
     std::cerr << "       " << programName << " --bench-inv [batches] [threads]   (batch inversion only)\n";
 }
@@ -1072,11 +1173,13 @@ int main(int argc, char* argv[])
         if (!std::strcmp(argv[i], "--bench") ||
             !std::strcmp(argv[i], "--bench-gen") ||
             !std::strcmp(argv[i], "--bench-hash") ||
-            !std::strcmp(argv[i], "--bench-inv")) {
+            !std::strcmp(argv[i], "--bench-inv") ||
+            !std::strcmp(argv[i], "--bench-gen-ifma")) {
             BenchMode mode = BenchMode::Full;
-            if (!std::strcmp(argv[i], "--bench-gen"))  mode = BenchMode::Gen;
-            if (!std::strcmp(argv[i], "--bench-hash")) mode = BenchMode::Hash;
-            if (!std::strcmp(argv[i], "--bench-inv"))  mode = BenchMode::Inv;
+            if (!std::strcmp(argv[i], "--bench-gen"))      mode = BenchMode::Gen;
+            if (!std::strcmp(argv[i], "--bench-gen-ifma")) mode = BenchMode::GenIFMA;
+            if (!std::strcmp(argv[i], "--bench-hash"))     mode = BenchMode::Hash;
+            if (!std::strcmp(argv[i], "--bench-inv"))      mode = BenchMode::Inv;
             long long batches = 1000;
             int benchThreads = 0; // 0 => all available procs
             if (i + 1 < argc) { long long v = std::strtoll(argv[i + 1], nullptr, 10); if (v > 0) batches = v; }
