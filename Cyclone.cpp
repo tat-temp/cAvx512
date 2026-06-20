@@ -34,7 +34,7 @@
 
 //------------------------------------------------------------------------------
 // Batch size: ±256 public keys (512), hashed in groups of 16 (AVX512).
-static constexpr int CPU_GROUP_SIZE = 32768;
+static constexpr int CPU_GROUP_SIZE = 4096;
 static constexpr int POINTS_BATCH_SIZE = 256;
 static constexpr int HASH_BATCH_SIZE   = 16;
 
