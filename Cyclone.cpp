@@ -502,6 +502,14 @@ static std::string hash160ToAddress(const std::vector<uint8_t> &h160) {
     return P2PKHDecoder::base58_encode(payload);
 }
 
+// Defined further below (need the IFMA helpers from ifma_field.h); forward-declared
+// so the self-test can drive the exact production search path.
+static void genGroupIFMA(Point &startP, Point *Gn, Point &_2Gn,
+                         std::vector<Int> &dx, IntGroup &grp, Point *pts);
+static int processGroupIFMA(Point &startP, Point *Gn, Point &_2Gn,
+                            std::vector<Int> &dx, IntGroup &grp, Point *pts,
+                            __m128i target16, const uint8_t *targetHash160);
+
 //------------------------------------------------------------------------------
 // 0.2 Correctness self-test. Returns 0 on success, 1 on any failure.
 //------------------------------------------------------------------------------
@@ -583,13 +591,15 @@ static int runSelfTest(Secp256K1 &secp) {
     std::vector<Int> dx(CPU_GROUP_SIZE / 2 + 1);
     IntGroup grp(CPU_GROUP_SIZE / 2 + 1);
     grp.Set(dx.data());
+    std::vector<Point> pts(CPU_GROUP_SIZE);   // scratch for the IFMA generator
     __m128i target16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(targetH.data()));
 
     bool found = false;
     std::string foundPrivHex, foundWif;
     while (!found) {
         if (priv.IsGreater(&endK)) break;
-        int idx = processGroupFused(startP, Gn.data(), _2Gn, dx, grp, target16, targetH.data());
+        int idx = processGroupIFMA(startP, Gn.data(), _2Gn, dx, grp, pts.data(),
+                                   target16, targetH.data());
         if (idx >= 0) {
             Int mPriv; mPriv.Set(&priv);
             Int off;   off.SetInt32((uint32_t)idx);
@@ -748,6 +758,32 @@ static void genGroupIFMA(Point &startP, Point *Gn, Point &_2Gn,
     pp.x.ModNeg(); pp.x.ModAdd(&p2); pp.x.ModSub(&_2Gn.x);
     pp.y.ModSub(&_2Gn.x, &pp.x); pp.y.ModMulK1(&s); pp.y.ModSub(&_2Gn.y);
     startP = pp;
+}
+
+// Production IFMA search path: generate the whole 4096-point group with the
+// 8-lane genGroupIFMA, then hash + compare each HASH_BATCH_SIZE chunk. Same
+// contract as processGroupFused (returns the in-group index of the first match
+// or -1, advances startP by CPU_GROUP_SIZE*G), but the per-point EC math runs on
+// AVX-512 IFMA. pts is caller-owned scratch of CPU_GROUP_SIZE Points, reused
+// across calls so there is no per-group allocation. The gen/hash fusion that
+// processGroupFused did gave 0% (compute-bound), so splitting them here is free.
+static int processGroupIFMA(Point &startP, Point *Gn, Point &_2Gn,
+                            std::vector<Int> &dx, IntGroup &grp, Point *pts,
+                            __m128i target16, const uint8_t *targetHash160) {
+    genGroupIFMA(startP, Gn, _2Gn, dx, grp, pts);
+
+    ALIGN64 uint8_t hashRes[HASH_BATCH_SIZE][20];
+    for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
+        computeHash160BatchBinSingle2(&pts[i], hashRes);
+        for (int L = 0; L < HASH_BATCH_SIZE; L++) {
+            __m128i cand = _mm_loadu_si128(reinterpret_cast<const __m128i *>(hashRes[L]));
+            if (_mm_movemask_epi8(_mm_cmpeq_epi8(cand, target16)) == 0xFFFF &&
+                std::memcmp(hashRes[L], targetHash160, 20) == 0) {
+                return i + L;
+            }
+        }
+    }
+    return -1;
 }
 
 static int runSelfTestIFMA() {
@@ -983,7 +1019,7 @@ static uint64_t processGroupGenOnly(Point &startP, Point *Gn, Point &_2Gn,
     return sink;
 }
 
-enum class BenchMode { Full, Gen, Hash, Inv, GenIFMA };
+enum class BenchMode { Full, Gen, Hash, Inv, GenIFMA, FullIFMA };
 
 //------------------------------------------------------------------------------
 // 0.1 Benchmark mode: run a fixed number of batches/thread with no I/O and no
@@ -1071,6 +1107,13 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
                 for (int k = 0; k <= CENTER; k++) acc ^= dx[k].bits64[0];
                 sink += acc;
             }
+        } else if (mode == BenchMode::FullIFMA) {
+            std::vector<Point> pts(CPU_GROUP_SIZE);
+            for (long long b = 0; b < batchesPerThread; ++b) {
+                int idx = processGroupIFMA(startP, Gn.data(), _2Gn, dx, grp,
+                                           pts.data(), target16, dummy);
+                if (idx >= 0) sink += 1; // never matches; keeps the work live
+            }
         } else { // Full
             for (long long b = 0; b < batchesPerThread; ++b) {
                 int idx = processGroupFused(startP, Gn.data(), _2Gn, dx, grp, target16, dummy);
@@ -1084,11 +1127,12 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
     const unsigned long long totalKeys =
         (unsigned long long)threads * (unsigned long long)batchesPerThread * CPU_GROUP_SIZE;
     const double mkeys = secs > 0.0 ? (totalKeys / secs / 1e6) : 0.0;
-    const char *modeName = mode == BenchMode::Gen     ? "GEN  (scalar point-gen only)"
-                         : mode == BenchMode::GenIFMA ? "GEN-IFMA (8-lane point-gen only)"
-                         : mode == BenchMode::Hash    ? "HASH (hash160 only)"
-                         : mode == BenchMode::Inv     ? "INV  (batch inversion only)"
-                                                      : "FULL (gen + hash)";
+    const char *modeName = mode == BenchMode::Gen      ? "GEN  (scalar point-gen only)"
+                         : mode == BenchMode::GenIFMA  ? "GEN-IFMA (8-lane point-gen only)"
+                         : mode == BenchMode::Hash     ? "HASH (hash160 only)"
+                         : mode == BenchMode::Inv      ? "INV  (batch inversion only)"
+                         : mode == BenchMode::FullIFMA ? "FULL-IFMA (8-lane gen + hash)"
+                                                       : "FULL (gen + hash)";
 
     std::cout << "================= BENCHMARK =================\n";
     std::cout << "Mode             : " << modeName << "\n";
@@ -1109,6 +1153,7 @@ static void printUsage(const char* programName) {
     std::cerr << "       " << programName << " --selftest            (correctness checks)\n";
     std::cerr << "       " << programName << " --selftest-ifma       (SIMD field-arith checks)\n";
     std::cerr << "       " << programName << " --bench [batches] [threads]       (full gen+hash)\n";
+    std::cerr << "       " << programName << " --bench-ifma [batches] [threads]  (8-lane gen+hash)\n";
     std::cerr << "       " << programName << " --bench-gen [batches] [threads]   (scalar point-gen)\n";
     std::cerr << "       " << programName << " --bench-gen-ifma [batches] [thr]  (8-lane point-gen)\n";
     std::cerr << "       " << programName << " --bench-hash [batches] [threads]  (hash160 only)\n";
@@ -1174,10 +1219,12 @@ int main(int argc, char* argv[])
             !std::strcmp(argv[i], "--bench-gen") ||
             !std::strcmp(argv[i], "--bench-hash") ||
             !std::strcmp(argv[i], "--bench-inv") ||
-            !std::strcmp(argv[i], "--bench-gen-ifma")) {
+            !std::strcmp(argv[i], "--bench-gen-ifma") ||
+            !std::strcmp(argv[i], "--bench-ifma")) {
             BenchMode mode = BenchMode::Full;
             if (!std::strcmp(argv[i], "--bench-gen"))      mode = BenchMode::Gen;
             if (!std::strcmp(argv[i], "--bench-gen-ifma")) mode = BenchMode::GenIFMA;
+            if (!std::strcmp(argv[i], "--bench-ifma"))     mode = BenchMode::FullIFMA;
             if (!std::strcmp(argv[i], "--bench-hash"))     mode = BenchMode::Hash;
             if (!std::strcmp(argv[i], "--bench-inv"))      mode = BenchMode::Inv;
             long long batches = 1000;
@@ -1321,6 +1368,9 @@ int main(int argc, char* argv[])
         Point _2Gn;
         buildGeneratorTable(secp, Gn, _2Gn);
 
+        // Scratch for the IFMA group generator (reused every group, no realloc).
+        std::vector<Point> pts(CPU_GROUP_SIZE);
+
         //#pragma omp critical
         {
             g_threadPrivateKeys[threadId].Set((Int*)&priv);
@@ -1333,7 +1383,8 @@ int main(int argc, char* argv[])
         while (!matchFound) {
             if (priv.IsGreater((Int*)&threadRangeEnd)) break;
 
-            int idx = processGroupFused(startP, Gn, _2Gn, dx, grp, target16, targetHash160.data());
+            int idx = processGroupIFMA(startP, Gn, _2Gn, dx, grp, pts.data(),
+                                       target16, targetHash160.data());
             if (idx >= 0) {
 #pragma omp critical(full_match)
                 {
