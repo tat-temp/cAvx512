@@ -25,6 +25,16 @@
 #include "Point.h"
 #include "Int.h"
 #include "IntGroup.h"
+#include <cstdlib>
+
+// Reference (non-AVX512) helpers defined in p2pkh_decoder.cpp but not exposed in
+// its header. Declared here so the --selftest correctness cross-check can compare
+// the AVX-512 hash160 path against this independent implementation.
+namespace P2PKHDecoder {
+    std::vector<uint8_t> compute_hash160(const std::vector<uint8_t>& data);
+    std::vector<uint8_t> compute_sha256(const std::vector<uint8_t>& data);
+    std::string base58_encode(const std::vector<uint8_t>& input);
+}
 
 #ifdef _MSC_VER
 #define ALIGN64 __declspec(align(64))
@@ -360,10 +370,315 @@ static void computeHash160BatchBinSingle2(
     );
 }
 
+//------------------------------------------------------------------------------
+// Phase 0 instrumentation: shared building blocks for --bench and --selftest.
+//
+// NOTE: generateGroupPoints mirrors the point-generation block inside main()'s
+// search loop verbatim. It is duplicated here (rather than refactored out of the
+// production hot loop) so this Phase-0 harness cannot perturb the real search
+// path while it is unverified. Phase 2 (fuse generation with hashing) will unify
+// the two copies; --selftest is what guards that change.
+//------------------------------------------------------------------------------
+static void buildGeneratorTable(Secp256K1 &secp, Point *Gn, Point &_2Gn) {
+    Point g = secp.G;
+    Gn[0] = g;
+    g = secp.DoubleDirect(g);
+    Gn[1] = g;
+    for (int i = 2; i < CPU_GROUP_SIZE / 2; i++) {
+        g = secp.AddDirect(g, secp.G);
+        Gn[i] = g;
+    }
+    _2Gn = secp.DoubleDirect(Gn[CPU_GROUP_SIZE / 2 - 1]);
+}
+
+// Fill pts[0..CPU_GROUP_SIZE-1] with the public keys for the consecutive private
+// keys [k, k+CPU_GROUP_SIZE-1], where startP on entry is the public key of
+// (k + CPU_GROUP_SIZE/2). startP is advanced by CPU_GROUP_SIZE*G on return.
+// dx must hold CPU_GROUP_SIZE/2+1 entries and grp must already be Set() to it.
+static void generateGroupPoints(Point &startP, Point *Gn, Point &_2Gn,
+                                std::vector<Int> &dx, IntGroup &grp, Point *pts) {
+    const int hLength = (CPU_GROUP_SIZE / 2 - 1);
+    Int dy, dyn, _s, _p;
+    Point pp, pn;
+    int j;
+
+    for (j = 0; j < hLength; j++) {
+        dx[j].ModSub(&Gn[j].x, &startP.x);
+    }
+    dx[j].ModSub(&Gn[j].x, &startP.x);
+    dx[j + 1].ModSub(&_2Gn.x, &startP.x);
+
+    grp.ModInv();
+
+    pts[CPU_GROUP_SIZE / 2] = startP;
+
+    for (j = 0; j < hLength; j++) {
+        pp = startP;
+        pn = startP;
+
+        dy.ModSub(&Gn[j].y, &pp.y);
+        _s.ModMulK1(&dy, &dx[j]);
+        _p.ModSquareK1(&_s);
+        pp.x.ModNeg();
+        pp.x.ModAdd(&_p);
+        pp.x.ModSub(&Gn[j].x);
+        pp.y.ModSub(&Gn[j].x, &pp.x);
+        pp.y.ModMulK1(&_s);
+        pp.y.ModSub(&Gn[j].y);
+
+        dyn.Set(&Gn[j].y);
+        dyn.ModNeg();
+        dyn.ModSub(&pn.y);
+        _s.ModMulK1(&dyn, &dx[j]);
+        _p.ModSquareK1(&_s);
+        pn.x.ModNeg();
+        pn.x.ModAdd(&_p);
+        pn.x.ModSub(&Gn[j].x);
+        pn.y.ModSub(&Gn[j].x, &pn.x);
+        pn.y.ModMulK1(&_s);
+        pn.y.ModAdd(&Gn[j].y);
+
+        pts[CPU_GROUP_SIZE / 2 + (j + 1)] = pp;
+        pts[CPU_GROUP_SIZE / 2 - (j + 1)] = pn;
+    }
+
+    pn = startP;
+    dyn.Set(&Gn[j].y);
+    dyn.ModNeg();
+    dyn.ModSub(&pn.y);
+    _s.ModMulK1(&dyn, &dx[j]);
+    _p.ModSquareK1(&_s);
+    pn.x.ModNeg();
+    pn.x.ModAdd(&_p);
+    pn.x.ModSub(&Gn[j].x);
+    pn.y.ModSub(&Gn[j].x, &pn.x);
+    pn.y.ModMulK1(&_s);
+    pn.y.ModAdd(&Gn[j].y);
+    pts[0] = pn;
+
+    pp = startP;
+    dy.ModSub(&_2Gn.y, &pp.y);
+    _s.ModMulK1(&dy, &dx[j + 1]);
+    _p.ModSquareK1(&_s);
+    pp.x.ModNeg();
+    pp.x.ModAdd(&_p);
+    pp.x.ModSub(&_2Gn.x);
+    pp.y.ModSub(&_2Gn.x, &pp.x);
+    pp.y.ModMulK1(&_s);
+    pp.y.ModSub(&_2Gn.y);
+    startP = pp;
+}
+
+// Build a mainnet P2PKH Base58Check address from a 20-byte hash160.
+static std::string hash160ToAddress(const std::vector<uint8_t> &h160) {
+    std::vector<uint8_t> payload;
+    payload.reserve(25);
+    payload.push_back(0x00); // version byte
+    payload.insert(payload.end(), h160.begin(), h160.end());
+    std::vector<uint8_t> c1 = P2PKHDecoder::compute_sha256(payload);
+    std::vector<uint8_t> c2 = P2PKHDecoder::compute_sha256(c1);
+    payload.insert(payload.end(), c2.begin(), c2.begin() + 4);
+    return P2PKHDecoder::base58_encode(payload);
+}
+
+//------------------------------------------------------------------------------
+// 0.2 Correctness self-test. Returns 0 on success, 1 on any failure.
+//------------------------------------------------------------------------------
+static int runSelfTest(Secp256K1 &secp) {
+    std::cout << "================= SELF TEST =================\n";
+    int failures = 0;
+
+    // --- Part A: AVX-512 hash160 vs the independent reference path -------------
+    std::vector<Int> testKeys;
+    for (uint32_t i = 1; i <= 40; ++i) { Int k; k.SetInt32(i); testKeys.push_back(k); }
+    const char *bigHex[] = {
+        "123456789ABCDEF",
+        "DEADBEEFCAFEBABE",
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140", // order-1
+        "8000000000000000000000000000000000000000000000000000000000000000",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "00000000000000000000000000000000000000007FFFFFFFFFFFFFFFFFFFFFFF"
+    };
+    for (const char *h : bigHex) testKeys.push_back(hexToInt(h));
+
+    int hashChecked = 0, hashFail = 0;
+    const size_t nKeys = testKeys.size();
+    for (size_t base = 0; base < nKeys; base += HASH_BATCH_SIZE) {
+        Point batch[HASH_BATCH_SIZE];
+        const size_t cnt = std::min<size_t>(HASH_BATCH_SIZE, nKeys - base);
+        for (size_t i = 0; i < HASH_BATCH_SIZE; ++i) {
+            Int k; k.Set(&testKeys[base + (i < cnt ? i : cnt - 1)]);
+            batch[i] = secp.ComputePublicKey(&k);
+        }
+        ALIGN64 uint8_t out[HASH_BATCH_SIZE][20];
+        computeHash160BatchBinSingle2(batch, out);
+        for (size_t i = 0; i < cnt; ++i) {
+            uint8_t comp[33];
+            pointToCompressedBin(batch[i], comp);
+            std::vector<uint8_t> ref =
+                P2PKHDecoder::compute_hash160(std::vector<uint8_t>(comp, comp + 33));
+            ++hashChecked;
+            if (std::memcmp(out[i], ref.data(), 20) != 0) {
+                ++hashFail;
+                Int kk; kk.Set(&testKeys[base + i]);
+                std::cout << "  [FAIL] hash160 mismatch for key "
+                          << padHexTo64(intToHex(kk)) << "\n";
+            }
+        }
+    }
+    std::cout << "Hash160 cross-check : " << (hashChecked - hashFail) << "/"
+              << hashChecked << " match\n";
+    if (hashFail) ++failures;
+
+    // --- Part B: end-to-end batched search finds a known in-range key ----------
+    Int k = hexToInt("ABCDEF");
+    Point Pk = secp.ComputePublicKey(&k);
+    uint8_t compk[33];
+    pointToCompressedBin(Pk, compk);
+    std::vector<uint8_t> targetH =
+        P2PKHDecoder::compute_hash160(std::vector<uint8_t>(compk, compk + 33));
+
+    const std::string addr = hash160ToAddress(targetH);
+    bool decodeOk = false;
+    try { decodeOk = (P2PKHDecoder::getHash160(addr) == targetH); }
+    catch (...) { decodeOk = false; }
+    std::cout << "Address round-trip  : " << (decodeOk ? "OK" : "FAIL")
+              << " (" << addr << ")\n";
+    if (!decodeOk) ++failures;
+
+    Int w;      w.SetInt32((uint32_t)CPU_GROUP_SIZE * 2);
+    Int startK; startK.Set(&k); startK.Sub(&w);
+    Int endK;   endK.Set(&k);   endK.Add(&w);
+
+    std::vector<Point> Gn(CPU_GROUP_SIZE / 2);
+    Point _2Gn;
+    buildGeneratorTable(secp, Gn.data(), _2Gn);
+
+    Int priv;   priv.Set(&startK);
+    Int half;   half.SetInt32(CPU_GROUP_SIZE / 2);
+    Int center; center.Set(&priv); center.Add(&half);
+    Point startP = secp.ComputePublicKey(&center);
+
+    std::vector<Int> dx(CPU_GROUP_SIZE / 2 + 1);
+    IntGroup grp(CPU_GROUP_SIZE / 2 + 1);
+    grp.Set(dx.data());
+    std::vector<Point> pts(CPU_GROUP_SIZE);
+    ALIGN64 uint8_t hashRes[HASH_BATCH_SIZE][20];
+    __m128i target16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(targetH.data()));
+
+    bool found = false;
+    std::string foundPrivHex, foundWif;
+    while (!found) {
+        if (priv.IsGreater(&endK)) break;
+        generateGroupPoints(startP, Gn.data(), _2Gn, dx, grp, pts.data());
+        for (int i = 0; i < CPU_GROUP_SIZE && !found; i += HASH_BATCH_SIZE) {
+            computeHash160BatchBinSingle2(pts.data() + i, hashRes);
+            for (int j = 0; j < HASH_BATCH_SIZE; ++j) {
+                __m128i cand = _mm_loadu_si128(reinterpret_cast<const __m128i *>(hashRes[j]));
+                if (_mm_movemask_epi8(_mm_cmpeq_epi8(cand, target16)) == 0xFFFF &&
+                    std::memcmp(hashRes[j], targetH.data(), 20) == 0) {
+                    const int idx = i + j;
+                    Int mPriv; mPriv.Set(&priv);
+                    Int off;   off.SetInt32((uint32_t)idx);
+                    mPriv.Add(&off);
+                    foundPrivHex = padHexTo64(intToHex(mPriv));
+                    foundWif = P2PKHDecoder::compute_wif(foundPrivHex, true);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        priv.Add((uint64_t)CPU_GROUP_SIZE);
+    }
+
+    const std::string expectHex = padHexTo64(intToHex(k));
+    const std::string expectWif = P2PKHDecoder::compute_wif(expectHex, true);
+    const bool e2eOk = found && (foundPrivHex == expectHex) && (foundWif == expectWif);
+    std::cout << "End-to-end search   : " << (e2eOk ? "OK" : "FAIL");
+    if (found) std::cout << " (found priv " << foundPrivHex << ")";
+    else       std::cout << " (key not found in window)";
+    std::cout << "\n";
+    if (!e2eOk) ++failures;
+
+    std::cout << "============================================\n";
+    std::cout << (failures == 0 ? "SELFTEST PASSED\n" : "SELFTEST FAILED\n");
+    return failures == 0 ? 0 : 1;
+}
+
+//------------------------------------------------------------------------------
+// 0.1 Benchmark mode: run a fixed number of batches/thread of the real hot path
+// (point generation + hash160) with no I/O and no early exit, then report
+// throughput. Run several times and take the median; use the optional thread
+// argument (e.g. "--bench 2000 1") for the single-thread number.
+//------------------------------------------------------------------------------
+static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int threads) {
+    if (threads <= 0) threads = omp_get_num_procs();
+
+    // Read-only generator table, built once outside the timed region and shared.
+    std::vector<Point> Gn(CPU_GROUP_SIZE / 2);
+    Point _2Gn;
+    buildGeneratorTable(secp, Gn.data(), _2Gn);
+
+    // A target that essentially never matches, so the loop never early-exits.
+    uint8_t dummy[20];
+    std::memset(dummy, 0xAB, sizeof(dummy));
+    __m128i target16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(dummy));
+
+    unsigned long long sink = 0; // consumes hash output so it can't be optimized away
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+
+    #pragma omp parallel num_threads(threads) reduction(+:sink)
+    {
+        const int tid = omp_get_thread_num();
+
+        Int priv;   priv.SetInt32((uint32_t)(tid + 1) * 1000003u); // distinct per thread
+        Int half;   half.SetInt32(CPU_GROUP_SIZE / 2);
+        Int center; center.Set(&priv); center.Add(&half);
+        Point startP = secp.ComputePublicKey(&center);
+
+        std::vector<Int> dx(CPU_GROUP_SIZE / 2 + 1);
+        IntGroup grp(CPU_GROUP_SIZE / 2 + 1);
+        grp.Set(dx.data());
+        std::vector<Point> pts(CPU_GROUP_SIZE);
+        ALIGN64 uint8_t hashRes[HASH_BATCH_SIZE][20];
+
+        for (long long b = 0; b < batchesPerThread; ++b) {
+            generateGroupPoints(startP, Gn.data(), _2Gn, dx, grp, pts.data());
+            for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
+                computeHash160BatchBinSingle2(pts.data() + i, hashRes);
+                for (int j = 0; j < HASH_BATCH_SIZE; ++j) {
+                    __m128i cand = _mm_loadu_si128(reinterpret_cast<const __m128i *>(hashRes[j]));
+                    sink += (unsigned long long)hashRes[j][0];
+                    if (_mm_movemask_epi8(_mm_cmpeq_epi8(cand, target16)) == 0xFFFF) sink += 1;
+                }
+            }
+        }
+    }
+
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+    const unsigned long long totalKeys =
+        (unsigned long long)threads * (unsigned long long)batchesPerThread * CPU_GROUP_SIZE;
+    const double mkeys = secs > 0.0 ? (totalKeys / secs / 1e6) : 0.0;
+
+    std::cout << "================= BENCHMARK =================\n";
+    std::cout << "Threads          : " << threads << "\n";
+    std::cout << "Batches/thread   : " << batchesPerThread
+              << "  (group size " << CPU_GROUP_SIZE << ")\n";
+    std::cout << "Keys hashed      : " << totalKeys << "\n";
+    std::cout << "Elapsed          : " << std::fixed << std::setprecision(3) << secs << " s\n";
+    std::cout << "Throughput       : " << std::fixed << std::setprecision(2) << mkeys
+              << " Mkeys/s\n";
+    std::cout << "(checksum sink   : " << sink << ")\n";
+    std::cout << "============================================\n";
+}
 
 //------------------------------------------------------------------------------
 static void printUsage(const char* programName) {
     std::cerr << "Usage: " << programName << " -a <Base58_P2PKH> -r <START:END>\n";
+    std::cerr << "       " << programName << " --selftest            (correctness checks)\n";
+    std::cerr << "       " << programName << " --bench [batches] [threads]  (throughput)\n";
 }
 
 static std::string formatElapsedTime(double seconds) {
@@ -412,6 +727,23 @@ static std::vector<ThreadRange> g_threadRanges;
 //------------------------------------------------------------------------------
 int main(int argc, char* argv[])
 {
+    // Phase 0 instrumentation entry points, handled before normal arg parsing.
+    for (int i = 1; i < argc; i++) {
+        if (!std::strcmp(argv[i], "--selftest")) {
+            Secp256K1 secp; secp.Init();
+            return runSelfTest(secp);
+        }
+        if (!std::strcmp(argv[i], "--bench")) {
+            long long batches = 1000;
+            int benchThreads = 0; // 0 => all available procs
+            if (i + 1 < argc) { long long v = std::strtoll(argv[i + 1], nullptr, 10); if (v > 0) batches = v; }
+            if (i + 2 < argc) { int t = std::atoi(argv[i + 2]); if (t > 0) benchThreads = t; }
+            Secp256K1 secp; secp.Init();
+            runBenchmark(secp, batches, benchThreads);
+            return 0;
+        }
+    }
+
     bool addressProvided = false, rangeProvided = false;
     std::string targetAddress, rangeInput;
     std::vector<uint8_t> targetHash160;
@@ -484,12 +816,7 @@ int main(int argc, char* argv[])
 
     const int numCPUs = omp_get_num_procs();
 
-    g_threadPrivateKeys.reserve(numCPUs);
-    for (int t = 0; t < numCPUs; t++)
-    {
-        Int p = new Int((uint64_t)0);
-        g_threadPrivateKeys[t] = p;
-    }
+    g_threadPrivateKeys.resize(numCPUs, Int((uint64_t)0));
 
     auto [chunkSize, remainder] = bigNumDivide(rangeSize, (uint64_t)numCPUs);
     g_threadRanges.resize(numCPUs);
