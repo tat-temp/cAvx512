@@ -919,6 +919,49 @@ static int runSelfTestIFMA() {
         }
     }
 
+    // to_compressed8 (C.1c): SoA -> 33-byte compressed pubkey, vs scalar reference
+    // (ifma_limbsToInt canonicalize + big-endian x + y parity). ifma_limbsToInt is
+    // the reference, so crafted >= p inputs validate reduce8's subtract path too.
+    int fComp = 0;
+    {
+        auto checkComp = [&](Int *xs, Int *ys) {
+            ifma::FieldVec8 X = ifma::load8(xs), Y = ifma::load8(ys);
+            uint8_t got[8][33];
+            ifma::to_compressed8(X, Y, &got[0][0], 33, 1);
+            for (int l = 0; l < 8; l++) {
+                uint64_t xl[5], yl[5];
+                ifma::int_to_limbs(xs[l], xl); ifma::int_to_limbs(ys[l], yl);
+                Int cx = ifma_limbsToInt(xl), cy = ifma_limbsToInt(yl);
+                uint8_t ref[33];
+                ref[0] = isEven(&cy) ? 0x02 : 0x03;
+                uint8_t *xb = cx.GetBytes();
+                for (int b = 0; b < 32; b++) ref[1 + b] = xb[31 - b]; // little-endian -> big-endian
+                if (std::memcmp(got[l], ref, 33) != 0) fComp++;
+            }
+        };
+        for (int b = 0; b < 4000; b++) {
+            Int xs[8], ys[8];
+            for (int j = 0; j < 8; j++) { xs[j] = ifma_randFE(); ys[j] = ifma_randFE(); }
+            checkComp(xs, ys);
+        }
+        // Edge values around the [p, 2^256) reduction window.
+        auto setW = [](Int &v, uint64_t w0, uint64_t w1, uint64_t w2, uint64_t w3) {
+            for (int i = 0; i < NB64BLOCK; i++) v.bits64[i] = 0;
+            v.bits64[0] = w0; v.bits64[1] = w1; v.bits64[2] = w2; v.bits64[3] = w3;
+        };
+        const uint64_t PH = 0xFFFFFFFFFFFFFFFFULL;
+        Int edge[8];
+        setW(edge[0], 0xFFFFFFFEFFFFFC2FULL, PH, PH, PH);                  // p        -> 0
+        setW(edge[1], 0xFFFFFFFEFFFFFC30ULL, PH, PH, PH);                  // p+1      -> 1
+        setW(edge[2], PH, PH, PH, PH);                                     // 2^256-1  -> R256-1
+        setW(edge[3], 0xFFFFFFFEFFFFFC2EULL, PH, PH, PH);                  // p-1      (unchanged)
+        setW(edge[4], 0, 0, 0, 0);                                         // 0
+        setW(edge[5], 1, 0, 0, 0);                                         // 1
+        setW(edge[6], 0xFFFFFFFEFFFFFC2FULL, PH, PH, 0x7FFFFFFFFFFFFFFFULL); // < p   (no subtract)
+        setW(edge[7], 0xFFFFFFFF00000000ULL, PH, PH, PH);                  // window   -> w0-P0
+        checkComp(edge, edge);
+    }
+
     auto line = [](const char *name, int fails) {
         std::cout << name << " : " << (fails == 0 ? "OK" : "FAIL");
         if (fails) std::cout << " (" << fails << " mismatches)";
@@ -935,8 +978,9 @@ static int runSelfTestIFMA() {
     line("gen8 plus            ", fGenP);
     line("gen8 minus           ", fGenM);
     line("genGroupIFMA         ", fGroup);
+    line("to_compressed8       ", fComp);
 
-    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr + fGenP + fGenM + fGroup;
+    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr + fGenP + fGenM + fGroup + fComp;
     std::cout << "================================================\n";
     std::cout << (failures == 0 ? "IFMA FIELD SELFTEST PASSED\n" : "IFMA FIELD SELFTEST FAILED\n");
     return failures == 0 ? 0 : 1;

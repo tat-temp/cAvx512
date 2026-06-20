@@ -15,6 +15,7 @@
 
 #include <immintrin.h>
 #include <cstdint>
+#include <cstring>
 #include "Int.h"
 
 namespace ifma {
@@ -216,6 +217,97 @@ static inline void gen8(const FieldVec8 &spx, const FieldVec8 &spy,
     if (plus) ry = sub(ts, gy);           // ry = s*(G.x-rx) - G.y
     else      ry = add(ts, gy);           // ry = s*(G.x-rx) + G.y
     normalize_weak(ry);
+}
+
+//-----------------------------------------------------------------------------
+// Stage C.1c: SoA -> bytes, skipping the per-lane Int round-trip.
+//
+// reduce8 fully canonicalizes 8 weakly-normalized lanes to packed 4x64
+// little-endian words W0..W3 (lane j holds words of lane j), each value in
+// [0, p). This is the SIMD twin of the scalar ifma_limbsToInt: carry-propagate,
+// fold the >=2^256 overflow via R256, pack 5x52->4x64, then one conditional
+// subtract of p (the only [p, 2^256) values have w1==w2==w3==~0, w0>=P0).
+//-----------------------------------------------------------------------------
+static inline void reduce8(const FieldVec8 &v,
+                           __m512i &W0, __m512i &W1, __m512i &W2, __m512i &W3) {
+    const __m512i M52 = _mm512_set1_epi64((long long)MASK52);
+    const __m512i M48 = _mm512_set1_epi64((long long)MASK48);
+    const __m512i R   = _mm512_set1_epi64((long long)R256);
+    __m512i n0 = v.n[0], n1 = v.n[1], n2 = v.n[2], n3 = v.n[3], n4 = v.n[4], c, over;
+
+    c = _mm512_srli_epi64(n0, 52); n0 = _mm512_and_si512(n0, M52); n1 = _mm512_add_epi64(n1, c);
+    c = _mm512_srli_epi64(n1, 52); n1 = _mm512_and_si512(n1, M52); n2 = _mm512_add_epi64(n2, c);
+    c = _mm512_srli_epi64(n2, 52); n2 = _mm512_and_si512(n2, M52); n3 = _mm512_add_epi64(n3, c);
+    c = _mm512_srli_epi64(n3, 52); n3 = _mm512_and_si512(n3, M52); n4 = _mm512_add_epi64(n4, c);
+
+    // Fold overflow above 2^256 back via R256. over is tiny, so two passes settle
+    // it for any value < ~2^257 (the second pass is a no-op for normal inputs).
+    for (int it = 0; it < 2; it++) {
+        over = _mm512_srli_epi64(n4, 48); n4 = _mm512_and_si512(n4, M48);
+        n0 = _mm512_add_epi64(n0, _mm512_mullo_epi64(over, R));
+        c = _mm512_srli_epi64(n0, 52); n0 = _mm512_and_si512(n0, M52); n1 = _mm512_add_epi64(n1, c);
+        c = _mm512_srli_epi64(n1, 52); n1 = _mm512_and_si512(n1, M52); n2 = _mm512_add_epi64(n2, c);
+        c = _mm512_srli_epi64(n2, 52); n2 = _mm512_and_si512(n2, M52); n3 = _mm512_add_epi64(n3, c);
+        c = _mm512_srli_epi64(n3, 52); n3 = _mm512_and_si512(n3, M52); n4 = _mm512_add_epi64(n4, c);
+    }
+
+    // Pack 5x52 -> 4x64 (high bits shifted past bit 63 are dropped, as intended).
+    W0 = _mm512_or_si512(n0,                        _mm512_slli_epi64(n1, 52));
+    W1 = _mm512_or_si512(_mm512_srli_epi64(n1, 12), _mm512_slli_epi64(n2, 40));
+    W2 = _mm512_or_si512(_mm512_srli_epi64(n2, 24), _mm512_slli_epi64(n3, 28));
+    W3 = _mm512_or_si512(_mm512_srli_epi64(n3, 36), _mm512_slli_epi64(n4, 16));
+
+    // Conditional subtract p (value < 2^256 < 2p, so at most one subtract).
+    const __m512i P0v  = _mm512_set1_epi64((long long)0xFFFFFFFEFFFFFC2FULL);
+    const __m512i PHIv = _mm512_set1_epi64((long long)0xFFFFFFFFFFFFFFFFULL);
+    const __m512i Z    = _mm512_setzero_si512();
+    __mmask8 m1 = _mm512_cmpeq_epi64_mask(W1, PHIv);
+    __mmask8 m2 = _mm512_cmpeq_epi64_mask(W2, PHIv);
+    __mmask8 m3 = _mm512_cmpeq_epi64_mask(W3, PHIv);
+    __mmask8 m0 = _mm512_cmp_epu64_mask(W0, P0v, _MM_CMPINT_NLT); // W0 >= P0
+    __mmask8 m  = (__mmask8)(m0 & m1 & m2 & m3);
+    W0 = _mm512_mask_sub_epi64(W0, m, W0, P0v);
+    W1 = _mm512_mask_mov_epi64(W1, m, Z);
+    W2 = _mm512_mask_mov_epi64(W2, m, Z);
+    W3 = _mm512_mask_mov_epi64(W3, m, Z);
+}
+
+// Emit 8 compressed pubkeys (0x02/0x03 || big-endian x, 33 bytes) from SoA
+// coords. Lane l is written to base + (long)l*step*slotBytes (mirrors storePts8's
+// base/step scatter, in byte slots). Parity comes from the canonical y; the 32
+// x-bytes are the canonical x in big-endian. No Int / GetBytes round-trip.
+static inline void to_compressed8(const FieldVec8 &rx, const FieldVec8 &ry,
+                                  uint8_t *base, long slotBytes, int step) {
+    __m512i xW0, xW1, xW2, xW3, yW0, yW1, yW2, yW3;
+    reduce8(rx, xW0, xW1, xW2, xW3);
+    reduce8(ry, yW0, yW1, yW2, yW3);
+
+    // Reverse the 8 bytes within each 64-bit lane: stored LE, this yields BE bytes.
+    const __m512i BSWAP = _mm512_set_epi8(
+        8,9,10,11,12,13,14,15, 0,1,2,3,4,5,6,7,
+        8,9,10,11,12,13,14,15, 0,1,2,3,4,5,6,7,
+        8,9,10,11,12,13,14,15, 0,1,2,3,4,5,6,7,
+        8,9,10,11,12,13,14,15, 0,1,2,3,4,5,6,7);
+    __m512i b3 = _mm512_shuffle_epi8(xW3, BSWAP);
+    __m512i b2 = _mm512_shuffle_epi8(xW2, BSWAP);
+    __m512i b1 = _mm512_shuffle_epi8(xW1, BSWAP);
+    __m512i b0 = _mm512_shuffle_epi8(xW0, BSWAP);
+
+    uint64_t t3[8], t2[8], t1[8], t0[8], yy[8];
+    _mm512_storeu_si512((void *)t3, b3);
+    _mm512_storeu_si512((void *)t2, b2);
+    _mm512_storeu_si512((void *)t1, b1);
+    _mm512_storeu_si512((void *)t0, b0);
+    _mm512_storeu_si512((void *)yy, yW0);
+
+    for (int l = 0; l < 8; l++) {
+        uint8_t *d = base + (long)l * step * slotBytes;
+        d[0] = (uint8_t)(0x02 | (yy[l] & 1ULL));   // 0x02 even, 0x03 odd
+        std::memcpy(d + 1,  &t3[l], 8);            // x, most-significant word first
+        std::memcpy(d + 9,  &t2[l], 8);
+        std::memcpy(d + 17, &t1[l], 8);
+        std::memcpy(d + 25, &t0[l], 8);
+    }
 }
 
 } // namespace ifma
