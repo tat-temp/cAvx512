@@ -614,13 +614,98 @@ static int runSelfTest(Secp256K1 &secp) {
     return failures == 0 ? 0 : 1;
 }
 
+// Point generation ONLY (no hashing) -- for --bench-gen, to attribute time
+// between the scalar EC math and the AVX-512 hashing. Mirrors processGroupFused's
+// generation exactly, but instead of hashing returns a checksum of the generated
+// coordinates so the work cannot be optimized away. Advances startP by GRP*G.
+static uint64_t processGroupGenOnly(Point &startP, Point *Gn, Point &_2Gn,
+                                    std::vector<Int> &dx, IntGroup &grp) {
+    const int CENTER  = CPU_GROUP_SIZE / 2;
+    const int hLength = CENTER - 1;
+    Int dy, dyn, _s, _p;
+    int j;
+
+    for (j = 0; j < hLength; j++) {
+        dx[j].ModSub(&Gn[j].x, &startP.x);
+    }
+    dx[j].ModSub(&Gn[j].x, &startP.x);
+    dx[j + 1].ModSub(&_2Gn.x, &startP.x);
+    grp.ModInv();
+
+    Point chunk[HASH_BATCH_SIZE];
+    uint64_t sink = 0;
+
+    for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
+        for (int L = 0; L < HASH_BATCH_SIZE; L++) {
+            const int idx = i + L;
+            Point &out = chunk[L];
+            if (idx == CENTER) {
+                out = startP;
+                continue;
+            }
+            if (idx > CENTER) {
+                const int m = idx - CENTER;
+                dy.ModSub(&Gn[m - 1].y, &startP.y);
+                _s.ModMulK1(&dy, &dx[m - 1]);
+                _p.ModSquareK1(&_s);
+                out.x.Set(&startP.x);
+                out.x.ModNeg();
+                out.x.ModAdd(&_p);
+                out.x.ModSub(&Gn[m - 1].x);
+                out.y.ModSub(&Gn[m - 1].x, &out.x);
+                out.y.ModMulK1(&_s);
+                out.y.ModSub(&Gn[m - 1].y);
+            } else {
+                const int m = CENTER - idx;
+                dyn.Set(&Gn[m - 1].y);
+                dyn.ModNeg();
+                dyn.ModSub(&startP.y);
+                _s.ModMulK1(&dyn, &dx[m - 1]);
+                _p.ModSquareK1(&_s);
+                out.x.Set(&startP.x);
+                out.x.ModNeg();
+                out.x.ModAdd(&_p);
+                out.x.ModSub(&Gn[m - 1].x);
+                out.y.ModSub(&Gn[m - 1].x, &out.x);
+                out.y.ModMulK1(&_s);
+                out.y.ModAdd(&Gn[m - 1].y);
+            }
+        }
+        for (int L = 0; L < HASH_BATCH_SIZE; L++) {
+            sink ^= chunk[L].x.bits64[0] ^ chunk[L].y.bits64[0];
+        }
+    }
+
+    Point pp = startP;
+    dy.ModSub(&_2Gn.y, &pp.y);
+    _s.ModMulK1(&dy, &dx[hLength + 1]);
+    _p.ModSquareK1(&_s);
+    pp.x.ModNeg();
+    pp.x.ModAdd(&_p);
+    pp.x.ModSub(&_2Gn.x);
+    pp.y.ModSub(&_2Gn.x, &pp.x);
+    pp.y.ModMulK1(&_s);
+    pp.y.ModSub(&_2Gn.y);
+    startP = pp;
+
+    return sink;
+}
+
+enum class BenchMode { Full, Gen, Hash };
+
 //------------------------------------------------------------------------------
-// 0.1 Benchmark mode: run a fixed number of batches/thread of the real hot path
-// (point generation + hash160) with no I/O and no early exit, then report
-// throughput. Run several times and take the median; use the optional thread
-// argument (e.g. "--bench 2000 1") for the single-thread number.
+// 0.1 Benchmark mode: run a fixed number of batches/thread with no I/O and no
+// early exit, then report throughput. Run several times and take the median; use
+// the optional thread argument (e.g. "--bench 2000 1") for the single-thread
+// number. Modes:
+//   Full -> point generation + hash160 (the real hot path)
+//   Gen  -> point generation only      (isolates the scalar EC math)
+//   Hash -> hash160 only               (isolates the AVX-512 hashing)
+// 1/rate_Full ~= 1/rate_Gen + 1/rate_Hash, so the time split is
+//   gen fraction  = rate_Full / rate_Gen,  hash fraction = rate_Full / rate_Hash.
 //------------------------------------------------------------------------------
-static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int threads) {
+static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int threads,
+                         BenchMode mode) {
     if (threads <= 0) threads = omp_get_num_procs();
 
     // Read-only generator table, built once outside the timed region and shared.
@@ -633,7 +718,7 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
     std::memset(dummy, 0xAB, sizeof(dummy));
     __m128i target16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(dummy));
 
-    unsigned long long sink = 0; // consumes hash output so it can't be optimized away
+    unsigned long long sink = 0; // consumes output so it can't be optimized away
 
     const auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -650,9 +735,34 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
         IntGroup grp(CPU_GROUP_SIZE / 2 + 1);
         grp.Set(dx.data());
 
-        for (long long b = 0; b < batchesPerThread; ++b) {
-            int idx = processGroupFused(startP, Gn.data(), _2Gn, dx, grp, target16, dummy);
-            if (idx >= 0) sink += 1; // never matches; keeps the hashing live
+        if (mode == BenchMode::Hash) {
+            // Hash a fixed (but valid, distinct) chunk repeatedly -- hash cost is
+            // data-independent, so the same number of hashes/compares as Full.
+            Point chunk[HASH_BATCH_SIZE];
+            for (int L = 0; L < HASH_BATCH_SIZE; L++) {
+                Int kk; kk.SetInt32((uint32_t)(tid + 1) * 1000003u + (uint32_t)L + 1u);
+                chunk[L] = secp.ComputePublicKey(&kk);
+            }
+            ALIGN64 uint8_t hashRes[HASH_BATCH_SIZE][20];
+            for (long long b = 0; b < batchesPerThread; ++b) {
+                for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
+                    computeHash160BatchBinSingle2(chunk, hashRes);
+                    for (int L = 0; L < HASH_BATCH_SIZE; L++) {
+                        __m128i cand = _mm_loadu_si128(reinterpret_cast<const __m128i *>(hashRes[L]));
+                        sink += (unsigned long long)hashRes[L][0];
+                        if (_mm_movemask_epi8(_mm_cmpeq_epi8(cand, target16)) == 0xFFFF) sink += 1;
+                    }
+                }
+            }
+        } else if (mode == BenchMode::Gen) {
+            for (long long b = 0; b < batchesPerThread; ++b) {
+                sink += processGroupGenOnly(startP, Gn.data(), _2Gn, dx, grp);
+            }
+        } else { // Full
+            for (long long b = 0; b < batchesPerThread; ++b) {
+                int idx = processGroupFused(startP, Gn.data(), _2Gn, dx, grp, target16, dummy);
+                if (idx >= 0) sink += 1; // never matches; keeps the work live
+            }
         }
     }
 
@@ -661,12 +771,16 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
     const unsigned long long totalKeys =
         (unsigned long long)threads * (unsigned long long)batchesPerThread * CPU_GROUP_SIZE;
     const double mkeys = secs > 0.0 ? (totalKeys / secs / 1e6) : 0.0;
+    const char *modeName = mode == BenchMode::Gen  ? "GEN  (point-gen only)"
+                         : mode == BenchMode::Hash ? "HASH (hash160 only)"
+                                                   : "FULL (gen + hash)";
 
     std::cout << "================= BENCHMARK =================\n";
+    std::cout << "Mode             : " << modeName << "\n";
     std::cout << "Threads          : " << threads << "\n";
     std::cout << "Batches/thread   : " << batchesPerThread
               << "  (group size " << CPU_GROUP_SIZE << ")\n";
-    std::cout << "Keys hashed      : " << totalKeys << "\n";
+    std::cout << "Keys processed   : " << totalKeys << "\n";
     std::cout << "Elapsed          : " << std::fixed << std::setprecision(3) << secs << " s\n";
     std::cout << "Throughput       : " << std::fixed << std::setprecision(2) << mkeys
               << " Mkeys/s\n";
@@ -678,7 +792,9 @@ static void runBenchmark(Secp256K1 &secp, long long batchesPerThread, int thread
 static void printUsage(const char* programName) {
     std::cerr << "Usage: " << programName << " -a <Base58_P2PKH> -r <START:END>\n";
     std::cerr << "       " << programName << " --selftest            (correctness checks)\n";
-    std::cerr << "       " << programName << " --bench [batches] [threads]  (throughput)\n";
+    std::cerr << "       " << programName << " --bench [batches] [threads]       (full gen+hash)\n";
+    std::cerr << "       " << programName << " --bench-gen [batches] [threads]   (point-gen only)\n";
+    std::cerr << "       " << programName << " --bench-hash [batches] [threads]  (hash160 only)\n";
 }
 
 static std::string formatElapsedTime(double seconds) {
@@ -733,13 +849,18 @@ int main(int argc, char* argv[])
             Secp256K1 secp; secp.Init();
             return runSelfTest(secp);
         }
-        if (!std::strcmp(argv[i], "--bench")) {
+        if (!std::strcmp(argv[i], "--bench") ||
+            !std::strcmp(argv[i], "--bench-gen") ||
+            !std::strcmp(argv[i], "--bench-hash")) {
+            BenchMode mode = BenchMode::Full;
+            if (!std::strcmp(argv[i], "--bench-gen"))  mode = BenchMode::Gen;
+            if (!std::strcmp(argv[i], "--bench-hash")) mode = BenchMode::Hash;
             long long batches = 1000;
             int benchThreads = 0; // 0 => all available procs
             if (i + 1 < argc) { long long v = std::strtoll(argv[i + 1], nullptr, 10); if (v > 0) batches = v; }
             if (i + 2 < argc) { int t = std::atoi(argv[i + 2]); if (t > 0) benchThreads = t; }
             Secp256K1 secp; secp.Init();
-            runBenchmark(secp, batches, benchThreads);
+            runBenchmark(secp, batches, benchThreads, mode);
             return 0;
         }
     }
