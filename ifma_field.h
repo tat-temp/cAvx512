@@ -171,9 +171,62 @@ static inline FieldVec8 mul(const FieldVec8 &a, const FieldVec8 &b) {
     return r;
 }
 
-// a^2 (mod p). First-correct version: just mul(a, a). (A dedicated squaring that
-// halves the cross-product count is a later optimization.)
-static inline FieldVec8 sqr(const FieldVec8 &a) { return mul(a, a); }
+// a^2 (mod p), 8-lane IFMA. Dedicated squaring: the 10 distinct off-diagonal
+// products a_i*a_j (i<j) are accumulated once then doubled (each appears twice in
+// the convolution), and the 5 diagonal squares a_i*a_i added once -- 30 madd52
+// ops vs mul's 50. Carry/fold/normalize phases are identical to mul. Inputs must
+// be weakly normalized (each limb < 2^52). Requires -mavx512ifma.
+static inline FieldVec8 sqr(const FieldVec8 &a) {
+    const __m512i M52 = _mm512_set1_epi64((long long)MASK52);
+    const __m512i RR  = _mm512_set1_epi64((long long)RR260);
+    const __m512i Z   = _mm512_setzero_si512();
+
+    // Phase 1a: off-diagonal products a_i*a_j (i<j), accumulated once.
+    __m512i d[10];
+    for (int i = 0; i < 10; i++) d[i] = Z;
+    for (int i = 0; i < 5; i++) {
+        for (int j = i + 1; j < 5; j++) {
+            d[i + j]     = _mm512_madd52lo_epu64(d[i + j],     a.n[i], a.n[j]);
+            d[i + j + 1] = _mm512_madd52hi_epu64(d[i + j + 1], a.n[i], a.n[j]);
+        }
+    }
+    // Phase 1b: double the off-diagonal contribution (each pair counts twice).
+    for (int i = 0; i < 10; i++) d[i] = _mm512_add_epi64(d[i], d[i]);
+    // Phase 1c: diagonal squares a_i*a_i, accumulated once (not doubled).
+    for (int i = 0; i < 5; i++) {
+        d[2 * i]     = _mm512_madd52lo_epu64(d[2 * i],     a.n[i], a.n[i]);
+        d[2 * i + 1] = _mm512_madd52hi_epu64(d[2 * i + 1], a.n[i], a.n[i]);
+    }
+
+    // Phase 2: carry-propagate so every d[k] < 2^52 (required as fold multiplicands).
+    __m512i c;
+    c = _mm512_srli_epi64(d[0], 52); d[0] = _mm512_and_si512(d[0], M52); d[1] = _mm512_add_epi64(d[1], c);
+    c = _mm512_srli_epi64(d[1], 52); d[1] = _mm512_and_si512(d[1], M52); d[2] = _mm512_add_epi64(d[2], c);
+    c = _mm512_srli_epi64(d[2], 52); d[2] = _mm512_and_si512(d[2], M52); d[3] = _mm512_add_epi64(d[3], c);
+    c = _mm512_srli_epi64(d[3], 52); d[3] = _mm512_and_si512(d[3], M52); d[4] = _mm512_add_epi64(d[4], c);
+    c = _mm512_srli_epi64(d[4], 52); d[4] = _mm512_and_si512(d[4], M52); d[5] = _mm512_add_epi64(d[5], c);
+    c = _mm512_srli_epi64(d[5], 52); d[5] = _mm512_and_si512(d[5], M52); d[6] = _mm512_add_epi64(d[6], c);
+    c = _mm512_srli_epi64(d[6], 52); d[6] = _mm512_and_si512(d[6], M52); d[7] = _mm512_add_epi64(d[7], c);
+    c = _mm512_srli_epi64(d[7], 52); d[7] = _mm512_and_si512(d[7], M52); d[8] = _mm512_add_epi64(d[8], c);
+    c = _mm512_srli_epi64(d[8], 52); d[8] = _mm512_and_si512(d[8], M52); d[9] = _mm512_add_epi64(d[9], c);
+
+    // Phase 3: fold high limbs d[5..9] into low via 2^260 == RR.
+    __m512i r0 = d[0], r1 = d[1], r2 = d[2], r3 = d[3], r4 = d[4], r5 = Z;
+    r0 = _mm512_madd52lo_epu64(r0, d[5], RR); r1 = _mm512_madd52hi_epu64(r1, d[5], RR);
+    r1 = _mm512_madd52lo_epu64(r1, d[6], RR); r2 = _mm512_madd52hi_epu64(r2, d[6], RR);
+    r2 = _mm512_madd52lo_epu64(r2, d[7], RR); r3 = _mm512_madd52hi_epu64(r3, d[7], RR);
+    r3 = _mm512_madd52lo_epu64(r3, d[8], RR); r4 = _mm512_madd52hi_epu64(r4, d[8], RR);
+    r4 = _mm512_madd52lo_epu64(r4, d[9], RR); r5 = _mm512_madd52hi_epu64(r5, d[9], RR);
+
+    // Phase 4: fold r5 (weight 2^260) back into r0/r1.
+    r0 = _mm512_madd52lo_epu64(r0, r5, RR);
+    r1 = _mm512_madd52hi_epu64(r1, r5, RR);
+
+    FieldVec8 r;
+    r.n[0] = r0; r.n[1] = r1; r.n[2] = r2; r.n[3] = r3; r.n[4] = r4;
+    normalize_weak(r);
+    return r;
+}
 
 // Broadcast one Int field element to all 8 lanes.
 static inline FieldVec8 broadcast(const Int &a) {
@@ -282,23 +335,32 @@ static inline void to_compressed8(const FieldVec8 &rx, const FieldVec8 &ry,
     reduce8(rx, xW0, xW1, xW2, xW3);
     reduce8(ry, yW0, yW1, yW2, yW3);
 
-    uint64_t w0[8], w1[8], w2[8], w3[8], y0[8];
-    _mm512_storeu_si512((void *)w0, xW0);
-    _mm512_storeu_si512((void *)w1, xW1);
-    _mm512_storeu_si512((void *)w2, xW2);
-    _mm512_storeu_si512((void *)w3, xW3);
+    // Reverse the 8 bytes within each 64-bit lane (pshufb, per-128-bit-lane byte
+    // reverse of each qword): stored little-endian, this yields big-endian bytes.
+    const __m512i BSWAP = _mm512_set_epi8(
+        8,9,10,11,12,13,14,15, 0,1,2,3,4,5,6,7,
+        8,9,10,11,12,13,14,15, 0,1,2,3,4,5,6,7,
+        8,9,10,11,12,13,14,15, 0,1,2,3,4,5,6,7,
+        8,9,10,11,12,13,14,15, 0,1,2,3,4,5,6,7);
+    __m512i b3 = _mm512_shuffle_epi8(xW3, BSWAP);
+    __m512i b2 = _mm512_shuffle_epi8(xW2, BSWAP);
+    __m512i b1 = _mm512_shuffle_epi8(xW1, BSWAP);
+    __m512i b0 = _mm512_shuffle_epi8(xW0, BSWAP);
+
+    uint64_t t3[8], t2[8], t1[8], t0[8], y0[8];
+    _mm512_storeu_si512((void *)t3, b3);
+    _mm512_storeu_si512((void *)t2, b2);
+    _mm512_storeu_si512((void *)t1, b1);
+    _mm512_storeu_si512((void *)t0, b0);
     _mm512_storeu_si512((void *)y0, yW0);
 
     for (int l = 0; l < 8; l++) {
         uint8_t *d = base + (long)l * step * slotBytes;
         d[0] = (uint8_t)(0x02 | (y0[l] & 1ULL));   // 0x02 even, 0x03 odd
-        // big-endian x = w3 : w2 : w1 : w0, each emitted most-significant byte first
-        const uint64_t W[4] = { w3[l], w2[l], w1[l], w0[l] };
-        for (int wi = 0; wi < 4; wi++) {
-            uint64_t v = W[wi];
-            for (int bi = 0; bi < 8; bi++)
-                d[1 + wi * 8 + bi] = (uint8_t)(v >> (56 - 8 * bi));
-        }
+        std::memcpy(d + 1,  &t3[l], 8);            // x, most-significant word first (big-endian)
+        std::memcpy(d + 9,  &t2[l], 8);
+        std::memcpy(d + 17, &t1[l], 8);
+        std::memcpy(d + 25, &t0[l], 8);
     }
 }
 
