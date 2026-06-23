@@ -29,14 +29,7 @@ hashing. On a representative AVX-512/IFMA CPU this runs at **~11.8 MKeys/s singl
 The full build command is kept at the top of `Cyclone.cpp`:
 
 ```bash
-g++ -std=c++17 -Ofast -ffast-math -funroll-loops -ftree-vectorize -fstrict-aliasing \
-    -fno-semantic-interposition -fvect-cost-model=unlimited -fno-trapping-math -fipa-ra \
-    -mavx512f -mavx512vl -mavx512bw -mavx512dq -mavx512ifma -fipa-modref -flto \
-    -fassociative-math -fopenmp -mavx2 -mbmi2 -madx \
-    -o Cyclone \
-    Cyclone.cpp SECP256K1.cpp Int.cpp IntGroup.cpp IntMod.cpp Point.cpp \
-    ripemd160_avx2.cpp p2pkh_decoder.cpp sha256_avx2.cpp \
-    ripemd160_avx512.cpp sha256_avx512.cpp
+g++ -std=c++17 -Ofast -ffast-math -funroll-loops -ftree-vectorize -fstrict-aliasing -fno-semantic-interposition -fvect-cost-model=unlimited -fno-trapping-math -fipa-ra -mavx512f -mavx512vl -mavx512bw -mavx512dq -mavx512ifma -fipa-modref -flto -fassociative-math -fopenmp -mavx2 -mbmi2 -madx -o Cyclone Cyclone.cpp SECP256K1.cpp Int.cpp IntGroup.cpp IntMod.cpp Point.cpp ripemd160_avx2.cpp p2pkh_decoder.cpp sha256_avx2.cpp ripemd160_avx512.cpp sha256_avx512.cpp
 ```
 
 Produces a single `./Cyclone` executable that handles search, self-test, and benchmark modes.
