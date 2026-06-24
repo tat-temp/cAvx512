@@ -14,4 +14,20 @@ extern "C" void sha256_avx512_16B(
     unsigned char* h12, unsigned char* h13, unsigned char* h14, unsigned char* h15
 );
 
+// Same as sha256_avx512_16B but the 16 inputs are 16 contiguous 64-byte blocks
+// starting at base (block k at base + k*64). Builds the schedule with an
+// in-register 16x16 transpose instead of a scalar byte gather.
+extern "C" void sha256_avx512_16B_packed(
+    const uint8_t* base,
+    unsigned char* h0,  unsigned char* h1,  unsigned char* h2,  unsigned char* h3,
+    unsigned char* h4,  unsigned char* h5,  unsigned char* h6,  unsigned char* h7,
+    unsigned char* h8,  unsigned char* h9,  unsigned char* h10, unsigned char* h11,
+    unsigned char* h12, unsigned char* h13, unsigned char* h14, unsigned char* h15
+);
+
+// Same input as sha256_avx512_16B_packed, but outputs the 8 SHA-256 state words
+// in SoA form (lane k == block k) to stateOut (8 contiguous __m512i, 64-byte
+// aligned) instead of byte digests -- for the fused SHA->RIPEMD path.
+extern "C" void sha256_avx512_16B_state(const uint8_t* base, void* stateOut);
+
 #endif

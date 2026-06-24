@@ -53,27 +53,16 @@ static inline void Initialize(__m512i* s) {
   h = g; g = f; f = e; e = _mm512_add_epi32(d,T1); \
   d = c; c = b; b = a; a = _mm512_add_epi32(T1,T2);
 
-static void Transform(__m512i* state, const uint8_t* data[16]) {
+// Message schedule expansion + 64 compression rounds, given the 16 already-built
+// big-endian schedule words W16[0..15] (lane i == word of block i). Folds the
+// result into state. Shared by both the byte-gather and packed (transposed)
+// front ends so there is a single compression implementation.
+static inline void sha256_compress(__m512i* state, const __m512i* W16) {
   __m512i a = state[0], b = state[1], c = state[2], d = state[3];
   __m512i e = state[4], f = state[5], g = state[6], h = state[7];
   __m512i W[64], T1, T2;
 
-  for (int t = 0; t < 16; t++) {
-    uint32_t tmp[16];
-    for (int i = 0; i < 16; i++) {
-      const uint8_t* p = data[i] + t*4;
-      tmp[i] = (uint32_t(p[0]) << 24) |
-               (uint32_t(p[1]) << 16) |
-               (uint32_t(p[2]) <<  8) |
-               (uint32_t(p[3]) <<  0);
-    }
-    W[t] = _mm512_setr_epi32(
-      tmp[0], tmp[1], tmp[2], tmp[3],
-      tmp[4], tmp[5], tmp[6], tmp[7],
-      tmp[8], tmp[9], tmp[10],tmp[11],
-      tmp[12],tmp[13],tmp[14],tmp[15]
-    );
-  }
+  for (int t = 0; t < 16; t++) W[t] = W16[t];
 
   for (int t = 16; t < 64; t++) {
     W[t] = _mm512_add_epi32(
@@ -97,6 +86,101 @@ static void Transform(__m512i* state, const uint8_t* data[16]) {
   state[7] = _mm512_add_epi32(state[7], h);
 }
 
+// Generic front end: build the 16 schedule words from 16 (possibly discontiguous)
+// input pointers via a scalar big-endian gather, then compress. Unchanged path;
+// kept as the independent reference the self-test cross-checks against.
+static void Transform(__m512i* state, const uint8_t* data[16]) {
+  __m512i W[16];
+
+  for (int t = 0; t < 16; t++) {
+    uint32_t tmp[16];
+    for (int i = 0; i < 16; i++) {
+      const uint8_t* p = data[i] + t*4;
+      tmp[i] = (uint32_t(p[0]) << 24) |
+               (uint32_t(p[1]) << 16) |
+               (uint32_t(p[2]) <<  8) |
+               (uint32_t(p[3]) <<  0);
+    }
+    W[t] = _mm512_setr_epi32(
+      tmp[0], tmp[1], tmp[2], tmp[3],
+      tmp[4], tmp[5], tmp[6], tmp[7],
+      tmp[8], tmp[9], tmp[10],tmp[11],
+      tmp[12],tmp[13],tmp[14],tmp[15]
+    );
+  }
+
+  sha256_compress(state, W);
+}
+
+// Packed front end: build the 16 schedule words from 16 CONTIGUOUS 64-byte blocks
+// (block k at base + k*64) using an in-register 16x16 dword transpose, replacing
+// the scalar 16x16 byte gather. Each row is byte-reversed (big-endian message
+// words) then the rows are transposed so W[t] lane k == word t of block k.
+static inline void transpose16x16_bswap(const uint8_t* base, __m512i W[16]) {
+  // Reverse the 4 bytes within every dword (little-endian load -> big-endian word).
+  const __m512i BSW = _mm512_set_epi8(
+      12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
+      12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
+      12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
+      12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3);
+
+  __m512i A[16];
+  for (int k = 0; k < 16; k++) {
+    __m512i row = _mm512_loadu_si512((const void*)(base + (long)k * 64));
+    A[k] = _mm512_shuffle_epi8(row, BSW);
+  }
+
+  // Stage 1: interleave dwords of adjacent rows.
+  __m512i b[16];
+  for (int k = 0; k < 8; k++) {
+    b[2*k]   = _mm512_unpacklo_epi32(A[2*k], A[2*k+1]);
+    b[2*k+1] = _mm512_unpackhi_epi32(A[2*k], A[2*k+1]);
+  }
+
+  // Stage 2: interleave qwords (within each 128-bit lane).
+  __m512i c[16];
+  for (int k = 0; k < 4; k++) {
+    __m512i x0 = b[4*k+0], x1 = b[4*k+1], x2 = b[4*k+2], x3 = b[4*k+3];
+    c[4*k+0] = _mm512_unpacklo_epi64(x0, x2);
+    c[4*k+1] = _mm512_unpackhi_epi64(x0, x2);
+    c[4*k+2] = _mm512_unpacklo_epi64(x1, x3);
+    c[4*k+3] = _mm512_unpackhi_epi64(x1, x3);
+  }
+
+  // Stages 3-4: assemble full columns across 128-bit lanes. For residue r the
+  // quad (c[r], c[r+4], c[r+8], c[r+12]) yields output words r, r+4, r+8, r+12.
+  for (int r = 0; r < 4; r++) {
+    __m512i p0 = c[r], p1 = c[r+4], p2 = c[r+8], p3 = c[r+12];
+    __m512i q0 = _mm512_shuffle_i32x4(p0, p1, 0x88);
+    __m512i q1 = _mm512_shuffle_i32x4(p0, p1, 0xdd);
+    __m512i q2 = _mm512_shuffle_i32x4(p2, p3, 0x88);
+    __m512i q3 = _mm512_shuffle_i32x4(p2, p3, 0xdd);
+    W[r + 0]  = _mm512_shuffle_i32x4(q0, q2, 0x88);
+    W[r + 8]  = _mm512_shuffle_i32x4(q0, q2, 0xdd);
+    W[r + 4]  = _mm512_shuffle_i32x4(q1, q3, 0x88);
+    W[r + 12] = _mm512_shuffle_i32x4(q1, q3, 0xdd);
+  }
+}
+
+// Transpose the 8 state lanes back to 16 big-endian 32-byte digests.
+static inline void store_digests(const __m512i* s, unsigned char* const H[16]) {
+  ALIGN64 uint32_t tmp[8][16];
+  for (int i = 0; i < 8; i++) {
+    _mm512_store_si512((__m512i*)tmp[i], s[i]);
+  }
+  for (int i = 0; i < 16; i++) {
+    for (int j = 0; j < 8; j++) {
+      uint32_t w = tmp[j][i];
+#ifdef _MSC_VER
+      w = _byteswap_ulong(w);
+#else
+      w = __builtin_bswap32(w);
+#endif
+      std::memcpy(H[i] + j*4, &w, 4);
+    }
+  }
+}
+
 extern "C" void sha256_avx512_16B(
   const uint8_t* d0,  const uint8_t* d1,  const uint8_t* d2,  const uint8_t* d3,
   const uint8_t* d4,  const uint8_t* d5,  const uint8_t* d6,  const uint8_t* d7,
@@ -115,25 +199,49 @@ extern "C" void sha256_avx512_16B(
   };
   Transform(s, data);
 
-  ALIGN64 uint32_t tmp[8][16];
-  for (int i = 0; i < 8; i++) {
-    _mm512_store_si512((__m512i*)tmp[i], s[i]);
-  }
+  unsigned char* H[16] = {
+    h0,h1,h2,h3,h4,h5,h6,h7,
+    h8,h9,h10,h11,h12,h13,h14,h15
+  };
+  store_digests(s, H);
+}
+
+// Like sha256_avx512_16B but for 16 contiguous 64-byte input blocks (block k at
+// base + k*64). Uses the in-register transpose; outputs are the same 16 digest
+// pointers. Used by the production block path (hash16Blocks).
+extern "C" void sha256_avx512_16B_packed(
+  const uint8_t* base,
+  unsigned char* h0,  unsigned char* h1,  unsigned char* h2,  unsigned char* h3,
+  unsigned char* h4,  unsigned char* h5,  unsigned char* h6,  unsigned char* h7,
+  unsigned char* h8,  unsigned char* h9,  unsigned char* h10, unsigned char* h11,
+  unsigned char* h12, unsigned char* h13, unsigned char* h14, unsigned char* h15
+) {
+  __m512i s[8];
+  Initialize(s);
+
+  __m512i W[16];
+  transpose16x16_bswap(base, W);
+  sha256_compress(s, W);
 
   unsigned char* H[16] = {
     h0,h1,h2,h3,h4,h5,h6,h7,
     h8,h9,h10,h11,h12,h13,h14,h15
   };
+  store_digests(s, H);
+}
 
-  for (int i = 0; i < 16; i++) {
-    for (int j = 0; j < 8; j++) {
-      uint32_t w = tmp[j][i];
-#ifdef _MSC_VER
-      w = _byteswap_ulong(w);
-#else
-      w = __builtin_bswap32(w);
-#endif
-      std::memcpy(H[i] + j*4, &w, 4);
-    }
-  }
+// Like sha256_avx512_16B_packed, but instead of writing 16 byte digests it
+// leaves the 8 SHA-256 state words in SoA form (lane k == block k, native
+// uint32) in stateOut (8 contiguous __m512i, 64-byte aligned). This skips the
+// output transpose so a fused RIPEMD front end can consume the state directly.
+extern "C" void sha256_avx512_16B_state(const uint8_t* base, void* stateOut) {
+  __m512i s[8];
+  Initialize(s);
+
+  __m512i W[16];
+  transpose16x16_bswap(base, W);
+  sha256_compress(s, W);
+
+  __m512i* out = (__m512i*)stateOut;
+  for (int i = 0; i < 8; i++) _mm512_store_si512(out + i, s[i]);
 }

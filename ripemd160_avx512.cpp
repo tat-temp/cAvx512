@@ -71,22 +71,24 @@ void Initialize(__m512i* s) {
     std::memcpy(s, _init, sizeof(_init));
 }
 
-void Transform(__m512i* s, uint8_t* blk[16]) {
+// 80-round RIPEMD-160 compression on pre-built SoA message words w[0..15]
+// (lane k == block k). Folds into state s[0..4], which must hold the IV on
+// entry. Shared by Transform (byte-pointer input, via LOADW) and the fused
+// SHA->RIPEMD path (which builds w from SHA state words).
+static void ripemd_rounds(__m512i* s, const __m512i* w) {
     __m512i a1 = _mm512_load_si512(s+0);
     __m512i b1 = _mm512_load_si512(s+1);
     __m512i c1 = _mm512_load_si512(s+2);
     __m512i d1 = _mm512_load_si512(s+3);
     __m512i e1 = _mm512_load_si512(s+4);
 
-__m512i a2 = a1;
+    __m512i a2 = a1;
     __m512i b2 = b1;
     __m512i c2 = c1;
     __m512i d2 = d1;
     __m512i e2 = e1;
 
     __m512i u;
-    __m512i w[16];
-    for (int i = 0; i < 16; ++i) w[i] = LOADW(i);
 
     // Rounds 0-15
     R11(a1, b1, c1, d1, e1, w[0], 11);
@@ -262,6 +264,16 @@ __m512i a2 = a1;
     s[4] = add3(t, b1, c2);
 }
 
+// Byte-pointer front end: build the 16 message words from 16 input blocks via
+// the scalar LOADW gather, then run the shared round engine. (blk[k] -> lane
+// 15-k here, matched by the reversed DEPACK in ripemd160avx512_32; the fused
+// path below uses its own lane k -> block k convention instead.)
+void Transform(__m512i* s, uint8_t* blk[16]) {
+    __m512i w[16];
+    for (int i = 0; i < 16; ++i) w[i] = LOADW(i);
+    ripemd_rounds(s, w);
+}
+
 #ifdef _WIN64
 #define DEPACK(d,i) \
   ((uint32_t*)d)[0] = _mm512_extract_epi32(s[0],i); \
@@ -315,6 +327,47 @@ void ripemd160avx512_32(
     DEPACK(d4,11);  DEPACK(d5,10);  DEPACK(d6,9);   DEPACK(d7,8);
     DEPACK(d8,7);   DEPACK(d9,6);   DEPACK(d10,5);  DEPACK(d11,4);
     DEPACK(d12,3);  DEPACK(d13,2);  DEPACK(d14,1);  DEPACK(d15,0);
+}
+
+// Fused SHA->RIPEMD front end: consume the 8 SHA-256 state words directly (SoA,
+// lane k == key k, native uint32) and run RIPEMD-160 on the 32-byte digest with
+// no digest store / no LOADW gather. RIPEMD word i (i<8) == bswap32(SHA word i);
+// words 8..15 are the fixed padding for a 32-byte message. Output uses lane k ->
+// d_k (input keeps lane k == key k), so DEPACK is NOT reversed here.
+void ripemd160_from_sha_state(
+    const __m512i* sha,
+    unsigned char* d0,  unsigned char* d1,  unsigned char* d2,  unsigned char* d3,
+    unsigned char* d4,  unsigned char* d5,  unsigned char* d6,  unsigned char* d7,
+    unsigned char* d8,  unsigned char* d9,  unsigned char* d10, unsigned char* d11,
+    unsigned char* d12, unsigned char* d13, unsigned char* d14, unsigned char* d15
+) {
+    // Per-dword byte reverse: SHA emits big-endian words, RIPEMD reads them
+    // little-endian, so w[i] == bswap32(sha[i]).
+    const __m512i BSW = _mm512_set_epi8(
+        12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
+        12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
+        12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
+        12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3);
+
+    __m512i w[16];
+    for (int i = 0; i < 8; ++i) w[i] = _mm512_shuffle_epi8(sha[i], BSW);
+    w[8]  = _mm512_set1_epi32(0x00000080); // 0x80 terminator at byte 32
+    w[9]  = _mm512_setzero_si512();
+    w[10] = _mm512_setzero_si512();
+    w[11] = _mm512_setzero_si512();
+    w[12] = _mm512_setzero_si512();
+    w[13] = _mm512_setzero_si512();
+    w[14] = _mm512_set1_epi32(0x00000100); // bit length 256 (32 bytes), little-endian
+    w[15] = _mm512_setzero_si512();
+
+    __m512i s[5];
+    Initialize(s);
+    ripemd_rounds(s, w);
+
+    DEPACK(d0,0);   DEPACK(d1,1);   DEPACK(d2,2);   DEPACK(d3,3);
+    DEPACK(d4,4);   DEPACK(d5,5);   DEPACK(d6,6);   DEPACK(d7,7);
+    DEPACK(d8,8);   DEPACK(d9,9);   DEPACK(d10,10); DEPACK(d11,11);
+    DEPACK(d12,12); DEPACK(d13,13); DEPACK(d14,14); DEPACK(d15,15);
 }
 
 } // namespace ripemd160avx512

@@ -6,8 +6,10 @@ public key, hashes it to `hash160`, and compares against the target.
 
 The hot path uses **8-lane AVX-512 IFMA** field arithmetic for point generation (batch-inversion
 "addition trick", one modular inverse per 4096-key group) and **AVX-512** SHA-256 + RIPEMD-160 for
-hashing. On a representative AVX-512/IFMA CPU this runs at **~11.8 MKeys/s single-thread** and
-**~134 MKeys/s** across all cores — about **1.84x / 1.91x** the original scalar implementation.
+hashing — with the SHA message schedule transposed in-register and the SHA-256 -> RIPEMD-160
+hand-off fused (skipping the intermediate 32-byte digest). On a representative AVX-512/IFMA CPU this
+runs at **~12.7 MKeys/s single-thread** and **~142 MKeys/s** across all cores — about **2.0x** the
+original scalar implementation.
 
 > The software is developed for solving Satoshi's puzzles; any use for illegal purposes is strictly
 > prohibited. The author is not responsible for any actions taken by the user when using this
@@ -46,6 +48,7 @@ Cyclone --bench-gen        [batches] [threads]    scalar point-gen only
 Cyclone --bench-gen-ifma   [batches] [threads]    8-lane point-gen only (Point output)
 Cyclone --bench-gen-blocks [batches] [threads]    8-lane point-gen only (SHA-block output)
 Cyclone --bench-hash       [batches] [threads]    hash160 only
+Cyclone --bench-hash-blocks[batches] [threads]    hash160 A/B: separate vs fused SHA->RIPEMD
 Cyclone --bench-inv        [batches] [threads]    batch inversion only
 ```
 
@@ -59,6 +62,7 @@ Cyclone --bench-inv        [batches] [threads]    batch inversion only
 | `--bench` / `--bench-ifma` | the whole gen+hash pipeline (scalar vs IFMA gen) |
 | `--bench-gen` / `--bench-gen-ifma` / `--bench-gen-blocks` | point generation only |
 | `--bench-hash` | AVX-512 SHA-256 + RIPEMD-160 only |
+| `--bench-hash-blocks` | hash160 only — same-binary A/B of separate vs fused SHA->RIPEMD |
 | `--bench-inv` | the per-group batch modular inversion only |
 
 The benches share the exact production code paths, and `1/rate_full ~= 1/rate_gen + 1/rate_hash`,
@@ -120,8 +124,8 @@ Mode             : FULL-IFMA (8-lane gen + hash)
 Threads          : 1
 Batches/thread   : 30000  (group size 4096)
 Keys processed   : 122880000
-Elapsed          : 10.450 s
-Throughput       : 11.76 Mkeys/s
+Elapsed          : 9.697 s
+Throughput       : 12.67 Mkeys/s
 (checksum sink   : ...)
 ============================================
 ```
@@ -131,11 +135,14 @@ Measured on the development CPU (median of several runs):
 | mode | 1 thread | all threads |
 |---|---:|---:|
 | `--bench` (scalar full) | 6.38 | 70.34 |
-| **`--bench-ifma` (IFMA full)** | **11.76** | **134.32** |
-| `--bench-gen-blocks` (gen only) | 23.81 | 264.93 |
-| derived hash160 (`1/full − 1/gen`) | ~23.2 | ~272 |
+| **`--bench-ifma` (IFMA full)** | **12.67** | **141.83** |
+| `--bench-gen-blocks` (gen only) | ~24.5 | ~265 |
+| `--bench-hash-blocks` fused (hash only) | 26.27 | 304.85 |
+| `--bench-hash-blocks` separate (hash only) | 23.64 | 271.52 |
 
-After the IFMA work the pipeline is **balanced ~50/50** between point generation and hashing.
+The in-register SHA transpose plus the fused SHA->RIPEMD hand-off make hashing **+11–12%** faster
+(same-binary A/B). With that, hashing is no longer the heavier stage — point generation now is —
+and the overall pipeline reaches **~2.0x** the scalar baseline.
 
 ## Production search
 
@@ -184,8 +191,12 @@ periodically so a long run can be monitored.
   formula in `gen8`. Points are emitted straight into SHA input blocks (`to_compressed8`), skipping
   any per-point `Int` round-trip.
 - **AVX-512 hashing** — 16-way SHA-256 then RIPEMD-160 (`hash16Blocks`) over the prebuilt blocks.
+  The SHA message-schedule transpose runs in-register (not a scalar byte gather), and the SHA-256
+  state is fed straight to RIPEMD-160 without materializing the 32-byte digest — the SHA output
+  transpose and the RIPEMD input transpose are inverses that cancel to a byteswap.
 - **Correctness** is guarded entirely by `--selftest` / `--selftest-ifma`; the IFMA path is checked
-  op-by-op and end-to-end against the scalar reference before every release.
+  op-by-op and end-to-end against the scalar reference before every release. The fused hash path is
+  cross-checked against the unmodified separate SHA/RIPEMD reference there too.
 
 ## Credits
 

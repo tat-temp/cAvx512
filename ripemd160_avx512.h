@@ -21,6 +21,17 @@ void ripemd160avx512_32(
     unsigned char* d12,  unsigned char* d13,  unsigned char* d14,  unsigned char* d15
 );
 
+// Fused SHA->RIPEMD: take the 8 SHA-256 state words (SoA, lane k == key k) and
+// emit the 16 RIPEMD-160 hash160 outputs, skipping the digest store + LOADW
+// gather. sha must point to 8 contiguous __m512i (64-byte aligned).
+void ripemd160_from_sha_state(
+    const __m512i* sha,
+    unsigned char* d0,   unsigned char* d1,   unsigned char* d2,   unsigned char* d3,
+    unsigned char* d4,   unsigned char* d5,   unsigned char* d6,   unsigned char* d7,
+    unsigned char* d8,   unsigned char* d9,   unsigned char* d10,  unsigned char* d11,
+    unsigned char* d12,  unsigned char* d13,  unsigned char* d14,  unsigned char* d15
+);
+
 }  // namespace ripemd160avx512
 
 #endif  // RIPEMD160_AVX512_H
