@@ -1322,6 +1322,98 @@ static void runBenchHashAB(Secp256K1 &secp, long long batchesPerThread, int thre
 }
 
 //------------------------------------------------------------------------------
+// Phase 7 probe -- gen/hash execution-port overlap.
+//
+// Production runs gen (IFMA integer multiply) then hash (SHA/RIPEMD logic+shuffle)
+// sequentially per group, so 1/full ~= 1/gen + 1/hash (a harmonic sum). gen and
+// hash lean on partly-disjoint ports, so interleaving them in one instruction
+// stream may let the out-of-order core run them concurrently and beat that
+// harmonic sum (toward max(gen,hash) if the ports were fully disjoint). This times
+// three loops in ONE binary -- gen-only, hash-only, and the two interleaved at the
+// production 2:1 work ratio (2 gen8 = 16 pts : 1 hash16 = 16 pts) -- and reports
+// whether interleaved > harmonic. That headroom (or its absence) is the gate for
+// restructuring the hot loop. 1T and all-core are reported separately: the
+// all-core answer can differ because SMT may already overlap gen/hash across
+// sibling threads. Correctness is irrelevant (throughput only), so gen8 runs on a
+// fixed base point and hash on fixed blocks; tiny per-iter perturbations stop the
+// optimizer from hoisting the otherwise loop-invariant work.
+//------------------------------------------------------------------------------
+static void runBenchOverlap(Secp256K1 &secp, long long iters, int threads) {
+    if (threads <= 0) threads = omp_get_num_procs();
+
+    std::vector<Point> Gn(CPU_GROUP_SIZE / 2);
+    Point _2Gn;
+    buildGeneratorTable(secp, Gn.data(), _2Gn);
+
+    unsigned long long sinkTotal = 0;
+
+    // mode: 0 = gen-only, 1 = hash-only, 2 = interleaved.
+    auto runPath = [&](int mode) -> double {
+        unsigned long long sink = 0;
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        #pragma omp parallel num_threads(threads) reduction(+:sink)
+        {
+            const int tid = omp_get_thread_num();
+            Int priv; priv.SetInt32((uint32_t)(tid + 1) * 1000003u);
+            Point P = secp.ComputePublicKey(&priv);
+            Int gx[8], gy[8], iv[8];
+            for (int l = 0; l < 8; l++) {
+                gx[l].Set(&Gn[l].x); gy[l].Set(&Gn[l].y);
+                Int d; d.ModSub(&Gn[l].x, &P.x); d.ModInv(); iv[l].Set(&d);
+            }
+            ifma::FieldVec8 SPX = ifma::broadcast(P.x), SPY = ifma::broadcast(P.y);
+            ifma::FieldVec8 GX = ifma::load8(gx), GY = ifma::load8(gy), IV = ifma::load8(iv);
+            ifma::FieldVec8 RX, RY;
+
+            std::vector<uint8_t> genBuf((size_t)CPU_GROUP_SIZE * 64);
+            std::vector<uint8_t> hashBuf((size_t)CPU_GROUP_SIZE * 64);
+            initBlocks(genBuf.data());
+            initBlocks(hashBuf.data());
+            ALIGN64 uint8_t hashRes[16][20];
+
+            for (long long i = 0; i < iters; i++) {
+                if (mode != 1) {  // gen: 2 gen8 -> 16 compressed keys
+                    GX.n[0] = _mm512_add_epi64(GX.n[0], _mm512_set1_epi64((long long)(i & 3))); // defeat hoist
+                    ifma::gen8(SPX, SPY, GX, GY, IV, true,  RX, RY);
+                    ifma::to_compressed8(RX, RY, genBuf.data(),          64, +1);
+                    ifma::gen8(SPX, SPY, GX, GY, IV, false, RX, RY);
+                    ifma::to_compressed8(RX, RY, genBuf.data() + 8 * 64, 64, +1);
+                    sink += (unsigned long long)genBuf[0] ^ (unsigned long long)genBuf[8 * 64 + 1];
+                }
+                if (mode != 0) {  // hash: 1 hash16 -> 16 hash160
+                    hashBuf[0] = (uint8_t)(0x02 | (i & 1)); // defeat hoist
+                    hash16Blocks(hashBuf.data(), hashRes);
+                    sink += (unsigned long long)hashRes[0][0] ^ (unsigned long long)hashRes[15][19];
+                }
+            }
+        }
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        sinkTotal += sink;
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        const unsigned long long keys = (unsigned long long)threads * (unsigned long long)iters * 16ULL;
+        return secs > 0.0 ? (keys / secs / 1e6) : 0.0;
+    };
+
+    (void)runPath(0); (void)runPath(1); (void)runPath(2);   // warm all three
+    const double rGen   = runPath(0);
+    const double rHash  = runPath(1);
+    const double rInter = runPath(2);
+    const double harm   = (rGen > 0.0 && rHash > 0.0) ? 1.0 / (1.0 / rGen + 1.0 / rHash) : 0.0;
+
+    std::cout << "============== GEN/HASH OVERLAP PROBE =============\n";
+    std::cout << "Threads             : " << threads << "\n";
+    std::cout << "Iters/thread        : " << iters << "  (16 keys/iter)\n";
+    std::cout << "gen-only            : " << std::fixed << std::setprecision(2) << rGen   << " Mkeys/s\n";
+    std::cout << "hash-only           : " << std::fixed << std::setprecision(2) << rHash  << " Mkeys/s\n";
+    std::cout << "harmonic (seq pred) : " << std::fixed << std::setprecision(2) << harm   << " Mkeys/s\n";
+    std::cout << "interleaved         : " << std::fixed << std::setprecision(2) << rInter << " Mkeys/s\n";
+    std::cout << "overlap factor      : " << std::fixed << std::setprecision(3)
+              << (harm > 0.0 ? rInter / harm : 0.0) << "x  (>1.00 => real overlap)\n";
+    std::cout << "(checksum sink      : " << sinkTotal << ")\n";
+    std::cout << "==================================================\n";
+}
+
+//------------------------------------------------------------------------------
 // 0.1 Benchmark mode: run a fixed number of batches/thread with no I/O and no
 // early exit, then report throughput. Run several times and take the median; use
 // the optional thread argument (e.g. "--bench 2000 1") for the single-thread
@@ -1472,6 +1564,7 @@ static void printUsage(const char* programName) {
     std::cerr << "       " << programName << " --bench-gen-blocks [batches][thr]  (block-path gen only)\n";
     std::cerr << "       " << programName << " --bench-hash [batches] [threads]  (hash160 only)\n";
     std::cerr << "       " << programName << " --bench-hash-blocks [batches][thr] (packed vs gather SHA, A/B)\n";
+    std::cerr << "       " << programName << " --bench-overlap [iters] [threads] (gen/hash port-overlap probe)\n";
     std::cerr << "       " << programName << " --bench-inv [batches] [threads]   (batch inversion only)\n";
 }
 
@@ -1537,6 +1630,15 @@ int main(int argc, char* argv[])
             if (i + 2 < argc) { int t = std::atoi(argv[i + 2]); if (t > 0) benchThreads = t; }
             Secp256K1 secp; secp.Init();
             runBenchHashAB(secp, batches, benchThreads);
+            return 0;
+        }
+        if (!std::strcmp(argv[i], "--bench-overlap")) {
+            long long iters = 1000000;
+            int benchThreads = 0;
+            if (i + 1 < argc) { long long v = std::strtoll(argv[i + 1], nullptr, 10); if (v > 0) iters = v; }
+            if (i + 2 < argc) { int t = std::atoi(argv[i + 2]); if (t > 0) benchThreads = t; }
+            Secp256K1 secp; secp.Init();
+            runBenchOverlap(secp, iters, benchThreads);
             return 0;
         }
         if (!std::strcmp(argv[i], "--bench") ||
