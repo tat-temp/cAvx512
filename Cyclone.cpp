@@ -1249,6 +1249,100 @@ static uint64_t processGroupGenOnly(Point &startP, Point *Gn, Point &_2Gn,
 enum class BenchMode { Full, Gen, Hash, Inv, GenIFMA, GenBlocks, FullIFMA };
 
 //------------------------------------------------------------------------------
+// Hash A/B isolation: hash ONE prebuilt 4096x64 block buffer with both SHA front
+// ends -- packed (in-register 16x16 transpose, via hash16Blocks) and generic
+// (scalar byte-gather sha256_avx512_16B + the same RIPEMD) -- in the SAME binary,
+// over identical data. SHA timing is data-independent, so this isolates the
+// transpose method with no cross-build code-layout confound. RIPEMD is identical
+// on both sides, so the rate delta is attributable to the SHA schedule build.
+//------------------------------------------------------------------------------
+static void runBenchHashAB(Secp256K1 &secp, long long batchesPerThread, int threads) {
+    if (threads <= 0) threads = omp_get_num_procs();
+
+    std::vector<Point> Gn(CPU_GROUP_SIZE / 2);
+    Point _2Gn;
+    buildGeneratorTable(secp, Gn.data(), _2Gn);
+
+    unsigned long long sinkTotal = 0;
+
+    auto runPath = [&](bool packed) -> double {
+        unsigned long long sink = 0;
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        #pragma omp parallel num_threads(threads) reduction(+:sink)
+        {
+            const int tid = omp_get_thread_num();
+            Int priv;   priv.SetInt32((uint32_t)(tid + 1) * 1000003u);
+            Int half;   half.SetInt32(CPU_GROUP_SIZE / 2);
+            Int center; center.Set(&priv); center.Add(&half);
+            Point startP = secp.ComputePublicKey(&center);
+            std::vector<Int> dx(CPU_GROUP_SIZE / 2 + 1);
+            IntGroup grp(CPU_GROUP_SIZE / 2 + 1); grp.Set(dx.data());
+
+            // Fill the buffer with real compressed keys once (untimed-amortized).
+            std::vector<uint8_t> blocks((size_t)CPU_GROUP_SIZE * 64);
+            initBlocks(blocks.data());
+            genGroupIFMABlocks(startP, Gn.data(), _2Gn, dx, grp, blocks.data());
+
+            ALIGN64 uint8_t hashRes[HASH_BATCH_SIZE][20];
+            ALIGN64 uint8_t digest[HASH_BATCH_SIZE][64];
+            for (long long b = 0; b < batchesPerThread; ++b) {
+                for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
+                    uint8_t *B = blocks.data() + (long)i * 64;
+                    if (packed) {
+                        hash16Blocks(B, hashRes);
+                    } else {
+                        sha256_avx512_16B(
+                            B + 0 * 64,  B + 1 * 64,  B + 2 * 64,  B + 3 * 64,
+                            B + 4 * 64,  B + 5 * 64,  B + 6 * 64,  B + 7 * 64,
+                            B + 8 * 64,  B + 9 * 64,  B + 10 * 64, B + 11 * 64,
+                            B + 12 * 64, B + 13 * 64, B + 14 * 64, B + 15 * 64,
+                            digest[0],  digest[1],  digest[2],  digest[3],
+                            digest[4],  digest[5],  digest[6],  digest[7],
+                            digest[8],  digest[9],  digest[10], digest[11],
+                            digest[12], digest[13], digest[14], digest[15]);
+                        ripemd160avx512::ripemd160avx512_32(
+                            digest[0],  digest[1],  digest[2],  digest[3],
+                            digest[4],  digest[5],  digest[6],  digest[7],
+                            digest[8],  digest[9],  digest[10], digest[11],
+                            digest[12], digest[13], digest[14], digest[15],
+                            hashRes[0],  hashRes[1],  hashRes[2],  hashRes[3],
+                            hashRes[4],  hashRes[5],  hashRes[6],  hashRes[7],
+                            hashRes[8],  hashRes[9],  hashRes[10], hashRes[11],
+                            hashRes[12], hashRes[13], hashRes[14], hashRes[15]);
+                    }
+                    sink += (unsigned long long)hashRes[0][0] ^ (unsigned long long)hashRes[15][19];
+                }
+            }
+        }
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        sinkTotal += sink;
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        const unsigned long long totalKeys =
+            (unsigned long long)threads * (unsigned long long)batchesPerThread * CPU_GROUP_SIZE;
+        return secs > 0.0 ? (totalKeys / secs / 1e6) : 0.0;
+    };
+
+    // Warm both paths once (touch code/data) before the measured runs.
+    (void)runPath(true);
+    (void)runPath(false);
+    const double rPacked  = runPath(true);
+    const double rGeneric = runPath(false);
+
+    std::cout << "============== HASH A/B (block path) ==============\n";
+    std::cout << "Threads          : " << threads << "\n";
+    std::cout << "Batches/thread   : " << batchesPerThread
+              << "  (group size " << CPU_GROUP_SIZE << ")\n";
+    std::cout << "Generic (gather)  : " << std::fixed << std::setprecision(2)
+              << rGeneric << " Mkeys/s\n";
+    std::cout << "Packed (transpose): " << std::fixed << std::setprecision(2)
+              << rPacked << " Mkeys/s\n";
+    std::cout << "Transpose speedup : " << std::fixed << std::setprecision(3)
+              << (rGeneric > 0.0 ? rPacked / rGeneric : 0.0) << "x\n";
+    std::cout << "(checksum sink   : " << sinkTotal << ")\n";
+    std::cout << "===================================================\n";
+}
+
+//------------------------------------------------------------------------------
 // 0.1 Benchmark mode: run a fixed number of batches/thread with no I/O and no
 // early exit, then report throughput. Run several times and take the median; use
 // the optional thread argument (e.g. "--bench 2000 1") for the single-thread
@@ -1398,6 +1492,7 @@ static void printUsage(const char* programName) {
     std::cerr << "       " << programName << " --bench-gen-ifma [batches] [thr]  (8-lane point-gen)\n";
     std::cerr << "       " << programName << " --bench-gen-blocks [batches][thr]  (block-path gen only)\n";
     std::cerr << "       " << programName << " --bench-hash [batches] [threads]  (hash160 only)\n";
+    std::cerr << "       " << programName << " --bench-hash-blocks [batches][thr] (packed vs gather SHA, A/B)\n";
     std::cerr << "       " << programName << " --bench-inv [batches] [threads]   (batch inversion only)\n";
 }
 
@@ -1455,6 +1550,15 @@ int main(int argc, char* argv[])
         }
         if (!std::strcmp(argv[i], "--selftest-ifma")) {
             return runSelfTestIFMA();
+        }
+        if (!std::strcmp(argv[i], "--bench-hash-blocks")) {
+            long long batches = 1000;
+            int benchThreads = 0;
+            if (i + 1 < argc) { long long v = std::strtoll(argv[i + 1], nullptr, 10); if (v > 0) batches = v; }
+            if (i + 2 < argc) { int t = std::atoi(argv[i + 2]); if (t > 0) benchThreads = t; }
+            Secp256K1 secp; secp.Init();
+            runBenchHashAB(secp, batches, benchThreads);
+            return 0;
         }
         if (!std::strcmp(argv[i], "--bench") ||
             !std::strcmp(argv[i], "--bench-gen") ||
