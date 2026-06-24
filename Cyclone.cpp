@@ -15,6 +15,7 @@
 #include <omp.h>
 #include <array>
 #include <utility>
+#include <mutex>
 // Adding program modules
 #include "p2pkh_decoder.h"
 #include "sha256_avx2.h"
@@ -785,29 +786,36 @@ static void ifma_batchInvert(Int *a, int n) {
     for (int i = K * 8; i < n; i++) a[i].ModInv();           // scalar leftover (< 8)
 }
 
-// Same Montgomery batch inversion, but the bulk inverses are returned in SoA form
-// (ivcol[k] lane l = 1/a[8k+l]) instead of being written back to a[] -- gen8 reads
-// ivcol directly, skipping the store8->Int->load8 round-trip the in-place version
-// pays. Only the first numBulk*8 elements take the IFMA path; the trailing
-// a[numBulk*8 .. n-1] (the scalar gen tail's differences) are inverted in place.
+// Same SoA Montgomery batch inversion, but the bulk x-differences are computed
+// 8-lane on the fly -- Dk = GXcol[k] - SPX (the pre-transposed generator x's minus
+// the broadcast center x) -- instead of read from a scalar dx[]. This removes the
+// ~numBulk*8 scalar ModSub of the bulk dx setup; only the <8 scalar-gen tail
+// (a[numBulk*8 .. n-1]) is still materialized as Int and inverted in place. sub() is
+// not normalized (limbs up to ~3*2^52) so each difference is normalize_weak'd before
+// the mul/inv8 chain; the backward pass recomputes it (the in-place version likewise
+// re-read a[], so this adds no buffer). ivcol[k] lane l = 1/(GXcol[k].lane l -
+// startP.x), congruent mod p to the old load8(dx) path -> bit-identical pubkeys.
 // Returns a pointer into a thread_local buffer, valid until this thread's next call.
-static const ifma::FieldVec8 *ifma_batchInvertSoA(Int *a, int numBulk, int n) {
+static const ifma::FieldVec8 *ifma_batchInvertSoA_sub(
+        const ifma::FieldVec8 *GXcol, const ifma::FieldVec8 &SPX,
+        Int *a, int numBulk, int n) {
     static thread_local ifma::FieldVec8 P[CPU_GROUP_SIZE / 16 + 1];
     static thread_local ifma::FieldVec8 ivcol[CPU_GROUP_SIZE / 16 + 1];
     if (numBulk > 0) {
-        P[0] = ifma::load8(&a[0]);
-        for (int k = 1; k < numBulk; k++)
-            P[k] = ifma::mul(P[k - 1], ifma::load8(&a[8 * k]));
-
-        ifma::FieldVec8 inv = ifma::inv8(P[numBulk - 1]);    // 1/(per-lane total product)
+        P[0] = ifma::sub(GXcol[0], SPX); ifma::normalize_weak(P[0]);   // 1/(GXcol[0]-SPX) start
+        for (int k = 1; k < numBulk; k++) {
+            ifma::FieldVec8 Dk = ifma::sub(GXcol[k], SPX); ifma::normalize_weak(Dk);
+            P[k] = ifma::mul(P[k - 1], Dk);                            // running prefix product
+        }
+        ifma::FieldVec8 inv = ifma::inv8(P[numBulk - 1]);             // 1/(per-lane total product)
         for (int k = numBulk - 1; k > 0; k--) {
-            ifma::FieldVec8 Dk = ifma::load8(&a[8 * k]);      // original (a[] is never overwritten here)
-            ivcol[k] = ifma::mul(P[k - 1], inv);             // = 1/a[8k+l] per lane l
+            ifma::FieldVec8 Dk = ifma::sub(GXcol[k], SPX); ifma::normalize_weak(Dk); // recompute diff
+            ivcol[k] = ifma::mul(P[k - 1], inv);                      // = 1/(GXcol[k]-SPX) per lane
             inv = ifma::mul(inv, Dk);
         }
-        ivcol[0] = inv;                                      // 1/a[0..7]
+        ivcol[0] = inv;                                              // 1/(GXcol[0]-SPX)
     }
-    for (int i = numBulk * 8; i < n; i++) a[i].ModInv();     // scalar tail (gen8-uncovered)
+    for (int i = numBulk * 8; i < n; i++) a[i].ModInv();             // scalar tail (gen8-uncovered)
     return ivcol;
 }
 
@@ -869,6 +877,28 @@ static void genGroupIFMA(Point &startP, Point *Gn, Point &_2Gn,
     startP = pp;
 }
 
+// Pre-transpose the generator table Gn[] to SoA, once. Gn = {1*G, 2*G, ...} depends
+// only on the curve, so it is identical across every group and thread; the cache is
+// built on the first call (thread-safely, via call_once) and shared read-only after,
+// replacing the per-group load8(gx)/load8(gy) marshalling of this fixed table.
+// GXcol[k] lane l = Gn[8k+l].x and GYcol[k] lane l = Gn[8k+l].y, for k in [0,numBulk).
+static void getGnSoA(Point *Gn, int numBulk,
+                     const ifma::FieldVec8 **gxOut, const ifma::FieldVec8 **gyOut) {
+    static ifma::FieldVec8 GXcol[CPU_GROUP_SIZE / 16 + 1];
+    static ifma::FieldVec8 GYcol[CPU_GROUP_SIZE / 16 + 1];
+    static std::once_flag flag;
+    std::call_once(flag, [&]() {
+        Int tx[8], ty[8];
+        for (int k = 0; k < numBulk; k++) {
+            for (int l = 0; l < 8; l++) { tx[l].Set(&Gn[8 * k + l].x); ty[l].Set(&Gn[8 * k + l].y); }
+            GXcol[k] = ifma::load8(tx);
+            GYcol[k] = ifma::load8(ty);
+        }
+    });
+    *gxOut = GXcol;
+    *gyOut = GYcol;
+}
+
 // Like genGroupIFMA, but writes each public key directly as a 33-byte compressed
 // SHA block (via to_compressed8 for the 8-lane bulk, storeCompScalar for the
 // tail) into the caller's pre-formatted CPU_GROUP_SIZE x 64 buffer -- no Point
@@ -878,30 +908,32 @@ static void genGroupIFMABlocks(Point &startP, Point *Gn, Point &_2Gn,
                                std::vector<Int> &dx, IntGroup &grp, uint8_t *blocks) {
     const int CENTER  = CPU_GROUP_SIZE / 2;
     const int hLength = CENTER - 1;
+    const int numBulk = hLength / 8;           // full 8-lane gen8 batches (dx[0..8*numBulk-1])
     int j;
 
-    for (j = 0; j < hLength; j++) dx[j].ModSub(&Gn[j].x, &startP.x);
+    // Bulk x-differences (dx[0..8*numBulk-1]) are computed 8-lane inside the inversion
+    // (GXcol - SPX); only the <8 scalar-gen tail differences materialize as Int here.
+    for (j = numBulk * 8; j < hLength; j++) dx[j].ModSub(&Gn[j].x, &startP.x);
     dx[j].ModSub(&Gn[j].x, &startP.x);     // dx[hLength]
     dx[j + 1].ModSub(&_2Gn.x, &startP.x);  // dx[CENTER] (for the advance)
-    const int numBulk = hLength / 8;           // full 8-lane gen8 batches (dx[0..8*numBulk-1])
-    const ifma::FieldVec8 *ivcol =             // bulk inverses in SoA; tail inverted in dx[]
-        ifma_batchInvertSoA(dx.data(), numBulk, CENTER + 1);
 
+    const ifma::FieldVec8 *GXcol, *GYcol;      // generator table, pre-transposed to SoA once
+    getGnSoA(Gn, numBulk, &GXcol, &GYcol);
     ifma::FieldVec8 SPX = ifma::broadcast(startP.x);
     ifma::FieldVec8 SPY = ifma::broadcast(startP.y);
+    const ifma::FieldVec8 *ivcol =             // bulk diffs = GXcol-SPX, inverted in SoA; tail in dx[]
+        ifma_batchInvertSoA_sub(GXcol, SPX, dx.data(), numBulk, CENTER + 1);
+
     storeCompScalar(startP, blocks + (long)CENTER * 64);
 
-    Int gx[8], gy[8];
     int kcol = 0;
     for (j = 0; j + 8 <= hLength; j += 8, ++kcol) {
-        for (int l = 0; l < 8; l++) {
-            gx[l].Set(&Gn[j + l].x); gy[l].Set(&Gn[j + l].y);
-        }
-        ifma::FieldVec8 GX = ifma::load8(gx), GY = ifma::load8(gy);
-        ifma::FieldVec8 RX, RY;                 // IV = ivcol[kcol] straight from the batch inverse
-        ifma::gen8(SPX, SPY, GX, GY, ivcol[kcol], true,  RX, RY);
+        // GX/GY from the pre-transposed table, IV from the batch inverse -- the bulk
+        // does no per-group Int<->SoA marshalling now (gx/gy/iv all come from SoA).
+        ifma::FieldVec8 RX, RY;
+        ifma::gen8(SPX, SPY, GXcol[kcol], GYcol[kcol], ivcol[kcol], true,  RX, RY);
         ifma::to_compressed8(RX, RY, blocks + (long)(CENTER + j + 1) * 64, 64, +1);
-        ifma::gen8(SPX, SPY, GX, GY, ivcol[kcol], false, RX, RY);
+        ifma::gen8(SPX, SPY, GXcol[kcol], GYcol[kcol], ivcol[kcol], false, RX, RY);
         ifma::to_compressed8(RX, RY, blocks + (long)(CENTER - j - 1) * 64, 64, -1);
     }
 

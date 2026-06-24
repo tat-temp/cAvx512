@@ -8,7 +8,7 @@ The hot path uses **8-lane AVX-512 IFMA** field arithmetic for point generation 
 **8-lane SIMD batch inversion** (Montgomery's trick run across the lanes, one Fermat inverse per
 group) — and **AVX-512** SHA-256 + RIPEMD-160 for hashing, with the SHA message schedule transposed
 in-register and the SHA-256 -> RIPEMD-160 hand-off fused (skipping the intermediate 32-byte digest).
-On a representative AVX-512/IFMA CPU this runs at **~15 MKeys/s single-thread** and **~172 MKeys/s**
+On a representative AVX-512/IFMA CPU this runs at **~15 MKeys/s single-thread** and **~175 MKeys/s**
 across all cores — about **2.4x** the original scalar implementation.
 
 > The software is developed for solving Satoshi's puzzles; any use for illegal purposes is strictly
@@ -128,8 +128,8 @@ Mode             : FULL-IFMA (8-lane gen + hash)
 Threads          : 1
 Batches/thread   : 30000  (group size 4096)
 Keys processed   : 122880000
-Elapsed          : 8.224 s
-Throughput       : 14.94 Mkeys/s
+Elapsed          : 8.038 s
+Throughput       : 15.29 Mkeys/s
 (checksum sink   : ...)
 ============================================
 ```
@@ -139,16 +139,18 @@ Measured on the development CPU (median of several runs):
 | mode | 1 thread | all threads |
 |---|---:|---:|
 | `--bench` (scalar full) | 6.38 | 70.34 |
-| **`--bench-ifma` (IFMA full)** | **14.94** | **171.87** |
-| `--bench-gen-blocks` (gen only) | ~33.1 | ~365 |
+| **`--bench-ifma` (IFMA full)** | **15.29** | **175.49** |
+| `--bench-gen-blocks` (gen only) | ~35.1 | ~394 |
 | `--bench-hash-blocks` msg33 (hash only) | 27.07 | 321.16 |
 | `--bench-hash-blocks` general (hash only) | 26.76 | 318.76 |
 
 Hashing was optimized first (in-register SHA transpose, fused SHA->RIPEMD hand-off, and the
 33-byte-message SHA specialization that `--bench-hash-blocks` isolates), which made point generation
 the bottleneck. The largest remaining gen cost was the batch inversion — about half of gen time, and
-fully scalar — so it was moved to an 8-lane SIMD Montgomery inversion (`ifma_batchInvert`), lifting
-`--bench-gen-blocks` from ~24.5 to ~33 (1T) and the full pipeline to **~2.4x** the scalar baseline.
+fully scalar — so it was moved to an 8-lane SIMD Montgomery inversion (`ifma_batchInvert`); the group's
+x-differences and the fixed generator table were then moved into SoA as well (formed `GXcol - center.x`
+8-lane rather than by a per-group scalar `ModSub` loop), lifting `--bench-gen-blocks` from ~24.5 to ~35
+(1T) and the full pipeline to **~2.4x** the scalar baseline.
 (`--bench-overlap` separately showed gen and hash do **not** overlap on the core's ports — both lean
 on the FMA units — so the two stages stay sequential rather than interleaved.)
 
@@ -196,8 +198,10 @@ periodically so a long run can be monitored.
   x-differences, instead of one inverse per key. That inversion is 8-lane SIMD (`ifma_batchInvert`):
   the differences are split across 8 lanes run as parallel Montgomery chains sharing one Fermat
   inverse (`ifma::inv8`, computing `a^(p-2)`), with the bulk inverses kept in SoA and fed straight to
-  `gen8` (no scalar round-trip). The point path keeps the scalar `IntGroup::ModInv` as the self-test
-  reference.
+  `gen8` (no scalar round-trip). The x-differences themselves are formed 8-lane from a pre-transposed
+  generator table (`GXcol - center.x`) rather than a per-group scalar `ModSub` loop, so the bulk gen
+  path does no per-group `Int`<->SoA marshalling. The point path keeps the scalar `IntGroup::ModInv`
+  as the self-test reference.
 - **8-lane IFMA field arithmetic** (`ifma_field.h`) — secp256k1 `Fp` in radix-2^52 (5 limbs x 8
   lanes, SoA), with `_mm512_madd52lo/hi_epu64` multiply, a dedicated squaring, and the EC slope
   formula in `gen8`. Points are emitted straight into SHA input blocks (`to_compressed8`), skipping
