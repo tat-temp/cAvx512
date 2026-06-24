@@ -48,7 +48,7 @@ Cyclone --bench-gen        [batches] [threads]    scalar point-gen only
 Cyclone --bench-gen-ifma   [batches] [threads]    8-lane point-gen only (Point output)
 Cyclone --bench-gen-blocks [batches] [threads]    8-lane point-gen only (SHA-block output)
 Cyclone --bench-hash       [batches] [threads]    hash160 only
-Cyclone --bench-hash-blocks[batches] [threads]    hash160 A/B: separate vs fused SHA->RIPEMD
+Cyclone --bench-hash-blocks[batches] [threads]    hash160 A/B: general vs msg33 SHA compress
 Cyclone --bench-inv        [batches] [threads]    batch inversion only
 ```
 
@@ -62,7 +62,7 @@ Cyclone --bench-inv        [batches] [threads]    batch inversion only
 | `--bench` / `--bench-ifma` | the whole gen+hash pipeline (scalar vs IFMA gen) |
 | `--bench-gen` / `--bench-gen-ifma` / `--bench-gen-blocks` | point generation only |
 | `--bench-hash` | AVX-512 SHA-256 + RIPEMD-160 only |
-| `--bench-hash-blocks` | hash160 only — same-binary A/B of separate vs fused SHA->RIPEMD |
+| `--bench-hash-blocks` | hash160 only — same-binary A/B of general vs msg33-specialized SHA compress |
 | `--bench-inv` | the per-group batch modular inversion only |
 
 The benches share the exact production code paths, and `1/rate_full ~= 1/rate_gen + 1/rate_hash`,
@@ -137,12 +137,14 @@ Measured on the development CPU (median of several runs):
 | `--bench` (scalar full) | 6.38 | 70.34 |
 | **`--bench-ifma` (IFMA full)** | **12.67** | **141.83** |
 | `--bench-gen-blocks` (gen only) | ~24.5 | ~265 |
-| `--bench-hash-blocks` fused (hash only) | 26.27 | 304.85 |
-| `--bench-hash-blocks` separate (hash only) | 23.64 | 271.52 |
+| `--bench-hash-blocks` msg33 (hash only) | 27.07 | 321.16 |
+| `--bench-hash-blocks` general (hash only) | 26.76 | 318.76 |
 
-The in-register SHA transpose plus the fused SHA->RIPEMD hand-off make hashing **+11–12%** faster
-(same-binary A/B). With that, hashing is no longer the heavier stage — point generation now is —
-and the overall pipeline reaches **~2.0x** the scalar baseline.
+Here `--bench-hash-blocks` isolates the 33-byte-message SHA specialization (general vs `msg33`
+compress, both on the fused path, ~+1%); earlier phases — the in-register SHA transpose and the
+fused SHA->RIPEMD hand-off — landed larger hash gains measured the same way. With all three,
+hashing is no longer the heavier stage — point generation now is — and the overall pipeline reaches
+**~2.0x** the scalar baseline.
 
 ## Production search
 
@@ -193,7 +195,9 @@ periodically so a long run can be monitored.
 - **AVX-512 hashing** — 16-way SHA-256 then RIPEMD-160 (`hash16Blocks`) over the prebuilt blocks.
   The SHA message-schedule transpose runs in-register (not a scalar byte gather), and the SHA-256
   state is fed straight to RIPEMD-160 without materializing the 32-byte digest — the SHA output
-  transpose and the RIPEMD input transpose are inverses that cancel to a byteswap.
+  transpose and the RIPEMD input transpose are inverses that cancel to a byteswap. Because the
+  message is always 33 bytes, SHA's constant schedule words and round 0 are folded at compile time
+  (`sha256_compress_msg33`).
 - **Correctness** is guarded entirely by `--selftest` / `--selftest-ifma`; the IFMA path is checked
   op-by-op and end-to-end against the scalar reference before every release. The fused hash path is
   cross-checked against the unmodified separate SHA/RIPEMD reference there too.
