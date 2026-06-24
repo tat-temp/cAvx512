@@ -1240,11 +1240,10 @@ enum class BenchMode { Full, Gen, Hash, Inv, GenIFMA, GenBlocks, FullIFMA };
 
 //------------------------------------------------------------------------------
 // Hash A/B isolation: hash ONE prebuilt 4096x64 block buffer two ways in the
-// SAME binary over identical data -- "fused" (hash16Blocks: SHA state handed
-// straight to RIPEMD) vs "separate" (packed SHA -> 32-byte digest store ->
-// RIPEMD input gather). BOTH use the in-register SHA transpose, so the only
-// difference is the SHA/RIPEMD boundary and the rate delta is the fusion win.
-// Hash timing is data-independent, so there is no cross-build layout confound.
+// SAME binary over identical data. Both use the fused SHA->RIPEMD path; the only
+// difference is the SHA compression -- "msg33" (33-byte-message specialized, the
+// production path) vs "general". The rate delta is the Phase 5 specialization
+// win. Hash timing is data-independent, so there is no cross-build layout confound.
 //------------------------------------------------------------------------------
 static void runBenchHashAB(Secp256K1 &secp, long long batchesPerThread, int threads) {
     if (threads <= 0) threads = omp_get_num_procs();
@@ -1255,7 +1254,7 @@ static void runBenchHashAB(Secp256K1 &secp, long long batchesPerThread, int thre
 
     unsigned long long sinkTotal = 0;
 
-    auto runPath = [&](bool fused) -> double {
+    auto runPath = [&](bool specialized) -> double {
         unsigned long long sink = 0;
         const auto t0 = std::chrono::high_resolution_clock::now();
         #pragma omp parallel num_threads(threads) reduction(+:sink)
@@ -1274,24 +1273,17 @@ static void runBenchHashAB(Secp256K1 &secp, long long batchesPerThread, int thre
             genGroupIFMABlocks(startP, Gn.data(), _2Gn, dx, grp, blocks.data());
 
             ALIGN64 uint8_t hashRes[HASH_BATCH_SIZE][20];
-            ALIGN64 uint8_t digest[HASH_BATCH_SIZE][64];
+            ALIGN64 __m512i st[8];
             for (long long b = 0; b < batchesPerThread; ++b) {
                 for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
                     uint8_t *B = blocks.data() + (long)i * 64;
-                    if (fused) {
-                        hash16Blocks(B, hashRes);
+                    if (specialized) {
+                        hash16Blocks(B, hashRes);   // msg33-specialized SHA + fused RIPEMD
                     } else {
-                        sha256_avx512_16B_packed(
-                            B,
-                            digest[0],  digest[1],  digest[2],  digest[3],
-                            digest[4],  digest[5],  digest[6],  digest[7],
-                            digest[8],  digest[9],  digest[10], digest[11],
-                            digest[12], digest[13], digest[14], digest[15]);
-                        ripemd160avx512::ripemd160avx512_32(
-                            digest[0],  digest[1],  digest[2],  digest[3],
-                            digest[4],  digest[5],  digest[6],  digest[7],
-                            digest[8],  digest[9],  digest[10], digest[11],
-                            digest[12], digest[13], digest[14], digest[15],
+                        // Same fused path, but the general (non-specialized) SHA compress.
+                        sha256_avx512_16B_state_general(B, st);
+                        ripemd160avx512::ripemd160_from_sha_state(
+                            st,
                             hashRes[0],  hashRes[1],  hashRes[2],  hashRes[3],
                             hashRes[4],  hashRes[5],  hashRes[6],  hashRes[7],
                             hashRes[8],  hashRes[9],  hashRes[10], hashRes[11],
@@ -1312,20 +1304,20 @@ static void runBenchHashAB(Secp256K1 &secp, long long batchesPerThread, int thre
     // Warm both paths once (touch code/data) before the measured runs.
     (void)runPath(true);
     (void)runPath(false);
-    const double rFused    = runPath(true);
-    const double rSeparate = runPath(false);
+    const double rSpecial = runPath(true);
+    const double rGeneral = runPath(false);
 
     std::cout << "============== HASH A/B (block path) ==============\n";
-    std::cout << "Threads             : " << threads << "\n";
-    std::cout << "Batches/thread      : " << batchesPerThread
+    std::cout << "Threads            : " << threads << "\n";
+    std::cout << "Batches/thread     : " << batchesPerThread
               << "  (group size " << CPU_GROUP_SIZE << ")\n";
-    std::cout << "Separate (SHA+RIPEMD): " << std::fixed << std::setprecision(2)
-              << rSeparate << " Mkeys/s\n";
-    std::cout << "Fused (SHA->RIPEMD) : " << std::fixed << std::setprecision(2)
-              << rFused << " Mkeys/s\n";
-    std::cout << "Fusion speedup      : " << std::fixed << std::setprecision(3)
-              << (rSeparate > 0.0 ? rFused / rSeparate : 0.0) << "x\n";
-    std::cout << "(checksum sink      : " << sinkTotal << ")\n";
+    std::cout << "General SHA (fused): " << std::fixed << std::setprecision(2)
+              << rGeneral << " Mkeys/s\n";
+    std::cout << "msg33 SHA (fused)  : " << std::fixed << std::setprecision(2)
+              << rSpecial << " Mkeys/s\n";
+    std::cout << "msg33 speedup      : " << std::fixed << std::setprecision(3)
+              << (rGeneral > 0.0 ? rSpecial / rGeneral : 0.0) << "x\n";
+    std::cout << "(checksum sink     : " << sinkTotal << ")\n";
     std::cout << "===================================================\n";
 }
 
