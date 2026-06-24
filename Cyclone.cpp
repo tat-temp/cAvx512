@@ -401,27 +401,17 @@ static inline void storeCompScalar(Point &pt, uint8_t *blk) {
     for (int b = 0; b < 32; b++) blk[1 + b] = xb[31 - b]; // little-endian -> big-endian
 }
 
-// Hash 16 consecutive 64-byte blocks (at B) to 16 hash160 outputs. NOT in place:
-// SHA reads the blocks into a separate 'digest' scratch, and RIPEMD reads/pads
-// that scratch. This matters because ripemd160avx512_32 writes its own padding
-// into bytes [32..63] of its input -- hashing in place would clobber the SHA
-// message padding (0x80 at [33], length at [62..63]) that initBlocks lays down
-// once and the buffer relies on persisting across reused groups.
+// Hash 16 consecutive 64-byte blocks (at B) to 16 hash160 outputs via the fused
+// SHA->RIPEMD path: SHA leaves its 8 state words in SoA registers and RIPEMD
+// consumes them directly (just a byteswap), with no 32-byte digest store and no
+// RIPEMD input gather -- the SHA output transpose and the RIPEMD input transpose
+// are inverses that cancel. B is read-only here, so the block buffer's padding
+// survives across reused groups with no scratch needed.
 static inline void hash16Blocks(uint8_t *B, uint8_t outHash[][20]) {
-    ALIGN64 uint8_t digest[HASH_BATCH_SIZE][64]; // SHA out / RIPEMD in (RIPEMD pads [32..63])
-    // B points to 16 contiguous 64-byte blocks, so use the packed SHA entry point
-    // (in-register 16x16 transpose) rather than the scalar byte-gather variant.
-    sha256_avx512_16B_packed(
-        B,
-        digest[0],  digest[1],  digest[2],  digest[3],
-        digest[4],  digest[5],  digest[6],  digest[7],
-        digest[8],  digest[9],  digest[10], digest[11],
-        digest[12], digest[13], digest[14], digest[15]);
-    ripemd160avx512::ripemd160avx512_32(
-        digest[0],  digest[1],  digest[2],  digest[3],
-        digest[4],  digest[5],  digest[6],  digest[7],
-        digest[8],  digest[9],  digest[10], digest[11],
-        digest[12], digest[13], digest[14], digest[15],
+    ALIGN64 __m512i shaState[8];
+    sha256_avx512_16B_state(B, shaState);
+    ripemd160avx512::ripemd160_from_sha_state(
+        shaState,
         outHash[0],  outHash[1],  outHash[2],  outHash[3],
         outHash[4],  outHash[5],  outHash[6],  outHash[7],
         outHash[8],  outHash[9],  outHash[10], outHash[11],
@@ -1249,12 +1239,12 @@ static uint64_t processGroupGenOnly(Point &startP, Point *Gn, Point &_2Gn,
 enum class BenchMode { Full, Gen, Hash, Inv, GenIFMA, GenBlocks, FullIFMA };
 
 //------------------------------------------------------------------------------
-// Hash A/B isolation: hash ONE prebuilt 4096x64 block buffer with both SHA front
-// ends -- packed (in-register 16x16 transpose, via hash16Blocks) and generic
-// (scalar byte-gather sha256_avx512_16B + the same RIPEMD) -- in the SAME binary,
-// over identical data. SHA timing is data-independent, so this isolates the
-// transpose method with no cross-build code-layout confound. RIPEMD is identical
-// on both sides, so the rate delta is attributable to the SHA schedule build.
+// Hash A/B isolation: hash ONE prebuilt 4096x64 block buffer two ways in the
+// SAME binary over identical data -- "fused" (hash16Blocks: SHA state handed
+// straight to RIPEMD) vs "separate" (packed SHA -> 32-byte digest store ->
+// RIPEMD input gather). BOTH use the in-register SHA transpose, so the only
+// difference is the SHA/RIPEMD boundary and the rate delta is the fusion win.
+// Hash timing is data-independent, so there is no cross-build layout confound.
 //------------------------------------------------------------------------------
 static void runBenchHashAB(Secp256K1 &secp, long long batchesPerThread, int threads) {
     if (threads <= 0) threads = omp_get_num_procs();
@@ -1265,7 +1255,7 @@ static void runBenchHashAB(Secp256K1 &secp, long long batchesPerThread, int thre
 
     unsigned long long sinkTotal = 0;
 
-    auto runPath = [&](bool packed) -> double {
+    auto runPath = [&](bool fused) -> double {
         unsigned long long sink = 0;
         const auto t0 = std::chrono::high_resolution_clock::now();
         #pragma omp parallel num_threads(threads) reduction(+:sink)
@@ -1288,14 +1278,11 @@ static void runBenchHashAB(Secp256K1 &secp, long long batchesPerThread, int thre
             for (long long b = 0; b < batchesPerThread; ++b) {
                 for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
                     uint8_t *B = blocks.data() + (long)i * 64;
-                    if (packed) {
+                    if (fused) {
                         hash16Blocks(B, hashRes);
                     } else {
-                        sha256_avx512_16B(
-                            B + 0 * 64,  B + 1 * 64,  B + 2 * 64,  B + 3 * 64,
-                            B + 4 * 64,  B + 5 * 64,  B + 6 * 64,  B + 7 * 64,
-                            B + 8 * 64,  B + 9 * 64,  B + 10 * 64, B + 11 * 64,
-                            B + 12 * 64, B + 13 * 64, B + 14 * 64, B + 15 * 64,
+                        sha256_avx512_16B_packed(
+                            B,
                             digest[0],  digest[1],  digest[2],  digest[3],
                             digest[4],  digest[5],  digest[6],  digest[7],
                             digest[8],  digest[9],  digest[10], digest[11],
@@ -1325,20 +1312,20 @@ static void runBenchHashAB(Secp256K1 &secp, long long batchesPerThread, int thre
     // Warm both paths once (touch code/data) before the measured runs.
     (void)runPath(true);
     (void)runPath(false);
-    const double rPacked  = runPath(true);
-    const double rGeneric = runPath(false);
+    const double rFused    = runPath(true);
+    const double rSeparate = runPath(false);
 
     std::cout << "============== HASH A/B (block path) ==============\n";
-    std::cout << "Threads          : " << threads << "\n";
-    std::cout << "Batches/thread   : " << batchesPerThread
+    std::cout << "Threads             : " << threads << "\n";
+    std::cout << "Batches/thread      : " << batchesPerThread
               << "  (group size " << CPU_GROUP_SIZE << ")\n";
-    std::cout << "Generic (gather)  : " << std::fixed << std::setprecision(2)
-              << rGeneric << " Mkeys/s\n";
-    std::cout << "Packed (transpose): " << std::fixed << std::setprecision(2)
-              << rPacked << " Mkeys/s\n";
-    std::cout << "Transpose speedup : " << std::fixed << std::setprecision(3)
-              << (rGeneric > 0.0 ? rPacked / rGeneric : 0.0) << "x\n";
-    std::cout << "(checksum sink   : " << sinkTotal << ")\n";
+    std::cout << "Separate (SHA+RIPEMD): " << std::fixed << std::setprecision(2)
+              << rSeparate << " Mkeys/s\n";
+    std::cout << "Fused (SHA->RIPEMD) : " << std::fixed << std::setprecision(2)
+              << rFused << " Mkeys/s\n";
+    std::cout << "Fusion speedup      : " << std::fixed << std::setprecision(3)
+              << (rSeparate > 0.0 ? rFused / rSeparate : 0.0) << "x\n";
+    std::cout << "(checksum sink      : " << sinkTotal << ")\n";
     std::cout << "===================================================\n";
 }
 

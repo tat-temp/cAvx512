@@ -229,3 +229,19 @@ extern "C" void sha256_avx512_16B_packed(
   };
   store_digests(s, H);
 }
+
+// Like sha256_avx512_16B_packed, but instead of writing 16 byte digests it
+// leaves the 8 SHA-256 state words in SoA form (lane k == block k, native
+// uint32) in stateOut (8 contiguous __m512i, 64-byte aligned). This skips the
+// output transpose so a fused RIPEMD front end can consume the state directly.
+extern "C" void sha256_avx512_16B_state(const uint8_t* base, void* stateOut) {
+  __m512i s[8];
+  Initialize(s);
+
+  __m512i W[16];
+  transpose16x16_bswap(base, W);
+  sha256_compress(s, W);
+
+  __m512i* out = (__m512i*)stateOut;
+  for (int i = 0; i < 8; i++) _mm512_store_si512(out + i, s[i]);
+}

@@ -25,4 +25,9 @@ extern "C" void sha256_avx512_16B_packed(
     unsigned char* h12, unsigned char* h13, unsigned char* h14, unsigned char* h15
 );
 
+// Same input as sha256_avx512_16B_packed, but outputs the 8 SHA-256 state words
+// in SoA form (lane k == block k) to stateOut (8 contiguous __m512i, 64-byte
+// aligned) instead of byte digests -- for the fused SHA->RIPEMD path.
+extern "C" void sha256_avx512_16B_state(const uint8_t* base, void* stateOut);
+
 #endif
