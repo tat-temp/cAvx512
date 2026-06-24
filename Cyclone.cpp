@@ -15,6 +15,7 @@
 #include <omp.h>
 #include <array>
 #include <utility>
+#include <mutex>
 // Adding program modules
 #include "p2pkh_decoder.h"
 #include "sha256_avx2.h"
@@ -869,6 +870,28 @@ static void genGroupIFMA(Point &startP, Point *Gn, Point &_2Gn,
     startP = pp;
 }
 
+// Pre-transpose the generator table Gn[] to SoA, once. Gn = {1*G, 2*G, ...} depends
+// only on the curve, so it is identical across every group and thread; the cache is
+// built on the first call (thread-safely, via call_once) and shared read-only after,
+// replacing the per-group load8(gx)/load8(gy) marshalling of this fixed table.
+// GXcol[k] lane l = Gn[8k+l].x and GYcol[k] lane l = Gn[8k+l].y, for k in [0,numBulk).
+static void getGnSoA(Point *Gn, int numBulk,
+                     const ifma::FieldVec8 **gxOut, const ifma::FieldVec8 **gyOut) {
+    static ifma::FieldVec8 GXcol[CPU_GROUP_SIZE / 16 + 1];
+    static ifma::FieldVec8 GYcol[CPU_GROUP_SIZE / 16 + 1];
+    static std::once_flag flag;
+    std::call_once(flag, [&]() {
+        Int tx[8], ty[8];
+        for (int k = 0; k < numBulk; k++) {
+            for (int l = 0; l < 8; l++) { tx[l].Set(&Gn[8 * k + l].x); ty[l].Set(&Gn[8 * k + l].y); }
+            GXcol[k] = ifma::load8(tx);
+            GYcol[k] = ifma::load8(ty);
+        }
+    });
+    *gxOut = GXcol;
+    *gyOut = GYcol;
+}
+
 // Like genGroupIFMA, but writes each public key directly as a 33-byte compressed
 // SHA block (via to_compressed8 for the 8-lane bulk, storeCompScalar for the
 // tail) into the caller's pre-formatted CPU_GROUP_SIZE x 64 buffer -- no Point
@@ -886,22 +909,21 @@ static void genGroupIFMABlocks(Point &startP, Point *Gn, Point &_2Gn,
     const int numBulk = hLength / 8;           // full 8-lane gen8 batches (dx[0..8*numBulk-1])
     const ifma::FieldVec8 *ivcol =             // bulk inverses in SoA; tail inverted in dx[]
         ifma_batchInvertSoA(dx.data(), numBulk, CENTER + 1);
+    const ifma::FieldVec8 *GXcol, *GYcol;      // generator table, pre-transposed to SoA once
+    getGnSoA(Gn, numBulk, &GXcol, &GYcol);
 
     ifma::FieldVec8 SPX = ifma::broadcast(startP.x);
     ifma::FieldVec8 SPY = ifma::broadcast(startP.y);
     storeCompScalar(startP, blocks + (long)CENTER * 64);
 
-    Int gx[8], gy[8];
     int kcol = 0;
     for (j = 0; j + 8 <= hLength; j += 8, ++kcol) {
-        for (int l = 0; l < 8; l++) {
-            gx[l].Set(&Gn[j + l].x); gy[l].Set(&Gn[j + l].y);
-        }
-        ifma::FieldVec8 GX = ifma::load8(gx), GY = ifma::load8(gy);
-        ifma::FieldVec8 RX, RY;                 // IV = ivcol[kcol] straight from the batch inverse
-        ifma::gen8(SPX, SPY, GX, GY, ivcol[kcol], true,  RX, RY);
+        // GX/GY from the pre-transposed table, IV from the batch inverse -- the bulk
+        // does no per-group Int<->SoA marshalling now (gx/gy/iv all come from SoA).
+        ifma::FieldVec8 RX, RY;
+        ifma::gen8(SPX, SPY, GXcol[kcol], GYcol[kcol], ivcol[kcol], true,  RX, RY);
         ifma::to_compressed8(RX, RY, blocks + (long)(CENTER + j + 1) * 64, 64, +1);
-        ifma::gen8(SPX, SPY, GX, GY, ivcol[kcol], false, RX, RY);
+        ifma::gen8(SPX, SPY, GXcol[kcol], GYcol[kcol], ivcol[kcol], false, RX, RY);
         ifma::to_compressed8(RX, RY, blocks + (long)(CENTER - j - 1) * 64, 64, -1);
     }
 
