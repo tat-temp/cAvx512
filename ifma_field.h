@@ -228,6 +228,36 @@ static inline FieldVec8 sqr(const FieldVec8 &a) {
     return r;
 }
 
+// r = a^(p-2) mod p, 8-lane (Fermat modular inverse). Uses the libsecp256k1
+// addition chain: p-2 has 1-blocks of lengths {1,2,22,223}, built from the
+// intermediates a^(2^k-1) for k in {2,3,6,9,11,22,44,88,176,220,223} then a final
+// window (the tail yields 2^256 - 2^32 - 2^10 + 2^5 + 13 == p-2). ~255 sqr + 15
+// mul. Input weakly normalized; output weakly normalized. Undefined for a == 0
+// (0^(p-2) = 0); callers invert nonzero x-differences only. Requires -mavx512ifma.
+static inline FieldVec8 inv8(const FieldVec8 &a) {
+    FieldVec8 x2, x3, x6, x9, x11, x22, x44, x88, x176, x220, x223, t;
+    int j;
+
+    x2 = sqr(a);  x2 = mul(x2, a);                     // a^(2^2 - 1)
+    x3 = sqr(x2); x3 = mul(x3, a);                     // a^(2^3 - 1)
+
+    x6  = x3;  for (j = 0; j < 3;  j++) x6  = sqr(x6);   x6  = mul(x6,  x3);  // a^(2^6 - 1)
+    x9  = x6;  for (j = 0; j < 3;  j++) x9  = sqr(x9);   x9  = mul(x9,  x3);  // a^(2^9 - 1)
+    x11 = x9;  for (j = 0; j < 2;  j++) x11 = sqr(x11);  x11 = mul(x11, x2);  // a^(2^11 - 1)
+    x22 = x11; for (j = 0; j < 11; j++) x22 = sqr(x22);  x22 = mul(x22, x11); // a^(2^22 - 1)
+    x44 = x22; for (j = 0; j < 22; j++) x44 = sqr(x44);  x44 = mul(x44, x22); // a^(2^44 - 1)
+    x88 = x44; for (j = 0; j < 44; j++) x88 = sqr(x88);  x88 = mul(x88, x44); // a^(2^88 - 1)
+    x176 = x88;  for (j = 0; j < 88; j++) x176 = sqr(x176); x176 = mul(x176, x88); // a^(2^176 - 1)
+    x220 = x176; for (j = 0; j < 44; j++) x220 = sqr(x220); x220 = mul(x220, x44); // a^(2^220 - 1)
+    x223 = x220; for (j = 0; j < 3;  j++) x223 = sqr(x223); x223 = mul(x223, x3);  // a^(2^223 - 1)
+
+    t = x223; for (j = 0; j < 23; j++) t = sqr(t); t = mul(t, x22);
+              for (j = 0; j < 5;  j++) t = sqr(t); t = mul(t, a);
+              for (j = 0; j < 3;  j++) t = sqr(t); t = mul(t, x2);
+              for (j = 0; j < 2;  j++) t = sqr(t); t = mul(t, a);
+    return t;
+}
+
 // Broadcast one Int field element to all 8 lanes.
 static inline FieldVec8 broadcast(const Int &a) {
     uint64_t L[5]; int_to_limbs(a, L);

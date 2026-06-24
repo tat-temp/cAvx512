@@ -901,7 +901,7 @@ static int runSelfTestIFMA() {
 
     std::cout << "============== IFMA FIELD SELFTEST ==============\n";
     const int BATCHES = 4000;      // 8 lanes -> 32k random vectors per op
-    int fRound = 0, fSoA = 0, fAdd = 0, fSub = 0, fNeg = 0, fNorm = 0, fMul = 0, fSqr = 0;
+    int fRound = 0, fSoA = 0, fAdd = 0, fSub = 0, fNeg = 0, fNorm = 0, fMul = 0, fSqr = 0, fInv = 0;
 
     for (int b = 0; b < BATCHES; b++) {
         Int a[8], bb[8];
@@ -966,6 +966,14 @@ static int runSelfTestIFMA() {
             Int got = ifma_limbsToInt(o[j]);
             Int exp; exp.ModSquareK1(&a[j]);
             if (!got.IsEqual(&exp)) fSqr++;
+        }
+
+        // inv8 (Fermat a^(p-2)) vs scalar Int::ModInv, lane-for-lane.
+        C = ifma::inv8(A); ifma::store8(C, o);
+        for (int j = 0; j < 8; j++) {
+            Int got = ifma_limbsToInt(o[j]);
+            Int exp; exp.Set(&a[j]); exp.ModInv();
+            if (!got.IsEqual(&exp)) fInv++;
         }
     }
 
@@ -1144,6 +1152,7 @@ static int runSelfTestIFMA() {
     line("normalize            ", fNorm);
     line("mul (IFMA)           ", fMul);
     line("sqr (IFMA)           ", fSqr);
+    line("inv8 (Fermat)        ", fInv);
     line("gen8 plus            ", fGenP);
     line("gen8 minus           ", fGenM);
     line("to_compressed8 (gen8)", fCompGen);
@@ -1152,7 +1161,7 @@ static int runSelfTestIFMA() {
     line("block path vs point  ", fBlocks);
     line("block advance drift  ", fAdv);
 
-    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr
+    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr + fInv
                  + fGenP + fGenM + fCompGen + fGroup + fComp + fBlocks + fAdv;
     std::cout << "================================================\n";
     std::cout << (failures == 0 ? "IFMA FIELD SELFTEST PASSED\n" : "IFMA FIELD SELFTEST FAILED\n");
