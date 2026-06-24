@@ -752,6 +752,39 @@ static inline void storePts8(const ifma::FieldVec8 &rx, const ifma::FieldVec8 &r
     }
 }
 
+// 8-lane Montgomery batch inversion: a[i] <- 1/a[i] mod p, in place (SIMD twin of
+// IntGroup::ModInv). The n elements are split into n/8 columns of 8; lane l runs a
+// Montgomery chain over a[l], a[8+l], a[16+l], ... so the 8 chains invert in
+// parallel sharing a single ifma::inv8, and the < 8 leftover is finished with
+// scalar Int::ModInv. All a[i] must be nonzero (true for distinct x-differences).
+// Validated directly against ModInv in --selftest-ifma, and end-to-end by the
+// block-vs-point check: this is the block path's inverse, while the point path
+// (genGroupIFMA) keeps the scalar ModInv as the independent reference.
+static void ifma_batchInvert(Int *a, int n) {
+    const int K = n / 8;   // number of 8-lane columns (column k = a[8k..8k+7])
+    if (K > 0) {
+        // Per-lane prefix products. static thread_local: not reallocated per group,
+        // and kept 64-byte aligned (FieldVec8 = 5x __m512i).
+        static thread_local ifma::FieldVec8 P[CPU_GROUP_SIZE / 16 + 1];
+        P[0] = ifma::load8(&a[0]);
+        for (int k = 1; k < K; k++)
+            P[k] = ifma::mul(P[k - 1], ifma::load8(&a[8 * k]));
+
+        ifma::FieldVec8 inv = ifma::inv8(P[K - 1]);          // 1/(per-lane total product)
+        uint64_t o[8][5];
+        for (int k = K - 1; k > 0; k--) {
+            ifma::FieldVec8 Dk   = ifma::load8(&a[8 * k]);   // original (not yet overwritten)
+            ifma::FieldVec8 outk = ifma::mul(P[k - 1], inv); // = 1/a[8k+l] per lane l
+            inv = ifma::mul(inv, Dk);                        // peel this column back out
+            ifma::store8(outk, o);
+            for (int l = 0; l < 8; l++) a[8 * k + l] = ifma_limbsToInt(o[l]);
+        }
+        ifma::store8(inv, o);                                // column 0: 1/a[0..7]
+        for (int l = 0; l < 8; l++) a[l] = ifma_limbsToInt(o[l]);
+    }
+    for (int i = K * 8; i < n; i++) a[i].ModInv();           // scalar leftover (< 8)
+}
+
 // IFMA group generator: fill pts[0..CPU_GROUP_SIZE-1] with pubkeys for the keys
 // [base, base+CPU_GROUP_SIZE) (startP on entry = pubkey of base+CENTER), using
 // gen8 (8 plus + 8 minus per batch) for the bulk and scalar for the tail. dx is
@@ -824,7 +857,7 @@ static void genGroupIFMABlocks(Point &startP, Point *Gn, Point &_2Gn,
     for (j = 0; j < hLength; j++) dx[j].ModSub(&Gn[j].x, &startP.x);
     dx[j].ModSub(&Gn[j].x, &startP.x);     // dx[hLength]
     dx[j + 1].ModSub(&_2Gn.x, &startP.x);  // dx[CENTER] (for the advance)
-    grp.ModInv();
+    ifma_batchInvert(dx.data(), CENTER + 1);   // 8-lane SIMD inverse (was grp.ModInv)
 
     ifma::FieldVec8 SPX = ifma::broadcast(startP.x);
     ifma::FieldVec8 SPY = ifma::broadcast(startP.y);
@@ -901,7 +934,7 @@ static int runSelfTestIFMA() {
 
     std::cout << "============== IFMA FIELD SELFTEST ==============\n";
     const int BATCHES = 4000;      // 8 lanes -> 32k random vectors per op
-    int fRound = 0, fSoA = 0, fAdd = 0, fSub = 0, fNeg = 0, fNorm = 0, fMul = 0, fSqr = 0, fInv = 0;
+    int fRound = 0, fSoA = 0, fAdd = 0, fSub = 0, fNeg = 0, fNorm = 0, fMul = 0, fSqr = 0, fInv = 0, fBatch = 0;
 
     for (int b = 0; b < BATCHES; b++) {
         Int a[8], bb[8];
@@ -974,6 +1007,17 @@ static int runSelfTestIFMA() {
             Int got = ifma_limbsToInt(o[j]);
             Int exp; exp.Set(&a[j]); exp.ModInv();
             if (!got.IsEqual(&exp)) fInv++;
+        }
+    }
+
+    // batch inversion (8-lane Montgomery, production-sized array) vs scalar ModInv.
+    {
+        const int N = CPU_GROUP_SIZE / 2 + 1;
+        std::vector<Int> bi(N), ref(N);
+        for (int b = 0; b < 20; b++) {
+            for (int i = 0; i < N; i++) { Int r = ifma_randFE(); bi[i] = r; ref[i] = r; ref[i].ModInv(); }
+            ifma_batchInvert(bi.data(), N);
+            for (int i = 0; i < N; i++) if (!bi[i].IsEqual(&ref[i])) fBatch++;
         }
     }
 
@@ -1153,6 +1197,7 @@ static int runSelfTestIFMA() {
     line("mul (IFMA)           ", fMul);
     line("sqr (IFMA)           ", fSqr);
     line("inv8 (Fermat)        ", fInv);
+    line("batch inversion      ", fBatch);
     line("gen8 plus            ", fGenP);
     line("gen8 minus           ", fGenM);
     line("to_compressed8 (gen8)", fCompGen);
@@ -1161,7 +1206,7 @@ static int runSelfTestIFMA() {
     line("block path vs point  ", fBlocks);
     line("block advance drift  ", fAdv);
 
-    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr + fInv
+    int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr + fInv + fBatch
                  + fGenP + fGenM + fCompGen + fGroup + fComp + fBlocks + fAdv;
     std::cout << "================================================\n";
     std::cout << (failures == 0 ? "IFMA FIELD SELFTEST PASSED\n" : "IFMA FIELD SELFTEST FAILED\n");
