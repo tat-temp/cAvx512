@@ -37,6 +37,25 @@ static const uint32_t K[64] = {
   0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
 };
 
+// Compile-time SHA-256 primitives, used to fold the constant parts of a fixed
+// 33-byte-message block (see sha256_compress_msg33). The compiler evaluates
+// these, so the folded constants provably match the runtime kernel.
+namespace {
+constexpr uint32_t crotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+constexpr uint32_t cBigS0(uint32_t x) { return crotr(x,2) ^ crotr(x,13) ^ crotr(x,22); }
+constexpr uint32_t cBigS1(uint32_t x) { return crotr(x,6) ^ crotr(x,11) ^ crotr(x,25); }
+constexpr uint32_t cSmS1(uint32_t x)  { return crotr(x,17) ^ crotr(x,19) ^ (x >> 10); }
+constexpr uint32_t cCh(uint32_t x, uint32_t y, uint32_t z)  { return (x & y) ^ (~x & z); }
+constexpr uint32_t cMaj(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (x & z) ^ (y & z); }
+constexpr uint32_t IV0=0x6a09e667u, IV1=0xbb67ae85u, IV2=0x3c6ef372u, IV3=0xa54ff53au,
+                   IV4=0x510e527fu, IV5=0x9b05688cu, IV6=0x1f83d9abu, IV7=0x5be0cd19u;
+// Round 0 reads only the constant IV + W[0]: T1 == ROUND0_T1C + W[0], T2 == ROUND0_T2C.
+constexpr uint32_t ROUND0_T1C  = IV7 + cBigS1(IV4) + cCh(IV4,IV5,IV6) + 0x428a2f98u; // + K[0]
+constexpr uint32_t ROUND0_T2C  = cBigS0(IV0) + cMaj(IV0,IV1,IV2);
+constexpr uint32_t MSG33_W15   = 0x108u;             // bit length 264 of a 33-byte message
+constexpr uint32_t MSG33_S1W15 = cSmS1(MSG33_W15);   // s1(W[15]) is constant
+} // anonymous namespace
+
 static inline void Initialize(__m512i* s) {
   static const uint32_t iv[8] = {
     0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
@@ -72,6 +91,59 @@ static inline void sha256_compress(__m512i* state, const __m512i* W16) {
   }
 
   for (int t = 0; t < 64; t++) {
+    __m512i Kt = _mm512_set1_epi32(K[t]);
+    ROUND(a,b,c,d,e,f,g,h,Kt,W[t],T1,T2);
+  }
+
+  state[0] = _mm512_add_epi32(state[0], a);
+  state[1] = _mm512_add_epi32(state[1], b);
+  state[2] = _mm512_add_epi32(state[2], c);
+  state[3] = _mm512_add_epi32(state[3], d);
+  state[4] = _mm512_add_epi32(state[4], e);
+  state[5] = _mm512_add_epi32(state[5], f);
+  state[6] = _mm512_add_epi32(state[6], g);
+  state[7] = _mm512_add_epi32(state[7], h);
+}
+
+// Compression specialized for a single fixed-shape 33-byte-message block (the
+// only thing this tool hashes): schedule words W[9..14] are 0 and W[15] is the
+// constant bit length 264, so the early schedule terms collapse and round 0
+// (constant IV + W[0]) is folded. W16[0..8] are the data words; W16[9..15] are
+// ignored. state must hold the standard IV on entry (single-block hash). Result
+// is identical to sha256_compress for such a block -- cross-checked by --selftest.
+static inline void sha256_compress_msg33(__m512i* state, const __m512i* W16) {
+  __m512i W[64], T1, T2;
+  for (int t = 0; t < 9; t++) W[t] = W16[t];
+  for (int t = 9; t < 15; t++) W[t] = _mm512_setzero_si512();
+  W[15] = _mm512_set1_epi32((int)MSG33_W15);
+
+  // Early expansion with the zero/constant schedule words folded out.
+  const __m512i s1w15 = _mm512_set1_epi32((int)MSG33_S1W15);
+  W[16] = _mm512_add_epi32(s0(W[1]), W[0]);                              // s1(W14)=0, W9=0
+  W[17] = _mm512_add_epi32(_mm512_add_epi32(s1w15, s0(W[2])), W[1]);     // s1(W15)=const, W10=0
+  W[18] = _mm512_add_epi32(_mm512_add_epi32(s1(W[16]), s0(W[3])), W[2]); // W11=0
+  W[19] = _mm512_add_epi32(_mm512_add_epi32(s1(W[17]), s0(W[4])), W[3]); // W12=0
+  W[20] = _mm512_add_epi32(_mm512_add_epi32(s1(W[18]), s0(W[5])), W[4]); // W13=0
+  W[21] = _mm512_add_epi32(_mm512_add_epi32(s1(W[19]), s0(W[6])), W[5]); // W14=0
+  W[22] = _mm512_add_epi32(_mm512_add_epi32(_mm512_add_epi32(s1(W[20]), W[15]), s0(W[7])), W[6]);
+  for (int t = 23; t < 64; t++) {
+    W[t] = _mm512_add_epi32(
+             _mm512_add_epi32(s1(W[t-2]), W[t-7]),
+             _mm512_add_epi32(s0(W[t-15]),W[t-16])
+           );
+  }
+
+  // Round 0 folded from the constant IV (only W[0] is data).
+  __m512i a = _mm512_add_epi32(_mm512_set1_epi32((int)(ROUND0_T1C + ROUND0_T2C)), W[0]);
+  __m512i b = _mm512_set1_epi32((int)IV0);
+  __m512i c = _mm512_set1_epi32((int)IV1);
+  __m512i d = _mm512_set1_epi32((int)IV2);
+  __m512i e = _mm512_add_epi32(_mm512_set1_epi32((int)(IV3 + ROUND0_T1C)), W[0]);
+  __m512i f = _mm512_set1_epi32((int)IV4);
+  __m512i g = _mm512_set1_epi32((int)IV5);
+  __m512i h = _mm512_set1_epi32((int)IV6);
+
+  for (int t = 1; t < 64; t++) {
     __m512i Kt = _mm512_set1_epi32(K[t]);
     ROUND(a,b,c,d,e,f,g,h,Kt,W[t],T1,T2);
   }
@@ -235,6 +307,21 @@ extern "C" void sha256_avx512_16B_packed(
 // uint32) in stateOut (8 contiguous __m512i, 64-byte aligned). This skips the
 // output transpose so a fused RIPEMD front end can consume the state directly.
 extern "C" void sha256_avx512_16B_state(const uint8_t* base, void* stateOut) {
+  __m512i s[8];
+  Initialize(s);
+
+  __m512i W[16];
+  transpose16x16_bswap(base, W);
+  sha256_compress_msg33(s, W);   // fixed 33-byte message: constant words folded
+
+  __m512i* out = (__m512i*)stateOut;
+  for (int i = 0; i < 8; i++) _mm512_store_si512(out + i, s[i]);
+}
+
+// Same as sha256_avx512_16B_state but with the GENERAL compression (no 33-byte
+// specialization). Used only as the same-binary A/B control for --bench-hash-blocks
+// so the msg33 speedup can be measured without a code-layout confound.
+extern "C" void sha256_avx512_16B_state_general(const uint8_t* base, void* stateOut) {
   __m512i s[8];
   Initialize(s);
 

@@ -27,7 +27,12 @@ extern "C" void sha256_avx512_16B_packed(
 
 // Same input as sha256_avx512_16B_packed, but outputs the 8 SHA-256 state words
 // in SoA form (lane k == block k) to stateOut (8 contiguous __m512i, 64-byte
-// aligned) instead of byte digests -- for the fused SHA->RIPEMD path.
+// aligned) instead of byte digests -- for the fused SHA->RIPEMD path. This is the
+// production path and uses the 33-byte-message specialization (sha256_compress_msg33).
 extern "C" void sha256_avx512_16B_state(const uint8_t* base, void* stateOut);
+
+// Identical interface but with the general (non-specialized) compression --
+// the A/B control for --bench-hash-blocks.
+extern "C" void sha256_avx512_16B_state_general(const uint8_t* base, void* stateOut);
 
 #endif
