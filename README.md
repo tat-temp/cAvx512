@@ -4,12 +4,12 @@ Multi-threaded, AVX-512 **secp256k1** key-search for Bitcoin P2PKH puzzles. Give
 P2PKH address and a hexadecimal private-key range, Cyclone enumerates the range, derives each
 public key, hashes it to `hash160`, and compares against the target.
 
-The hot path uses **8-lane AVX-512 IFMA** field arithmetic for point generation (batch-inversion
-"addition trick", one modular inverse per 4096-key group) and **AVX-512** SHA-256 + RIPEMD-160 for
-hashing — with the SHA message schedule transposed in-register and the SHA-256 -> RIPEMD-160
-hand-off fused (skipping the intermediate 32-byte digest). On a representative AVX-512/IFMA CPU this
-runs at **~12.7 MKeys/s single-thread** and **~142 MKeys/s** across all cores — about **2.0x** the
-original scalar implementation.
+The hot path uses **8-lane AVX-512 IFMA** field arithmetic for point generation — including an
+**8-lane SIMD batch inversion** (Montgomery's trick run across the lanes, one Fermat inverse per
+group) — and **AVX-512** SHA-256 + RIPEMD-160 for hashing, with the SHA message schedule transposed
+in-register and the SHA-256 -> RIPEMD-160 hand-off fused (skipping the intermediate 32-byte digest).
+On a representative AVX-512/IFMA CPU this runs at **~15 MKeys/s single-thread** and **~172 MKeys/s**
+across all cores — about **2.4x** the original scalar implementation.
 
 > The software is developed for solving Satoshi's puzzles; any use for illegal purposes is strictly
 > prohibited. The author is not responsible for any actions taken by the user when using this
@@ -49,7 +49,8 @@ Cyclone --bench-gen-ifma   [batches] [threads]    8-lane point-gen only (Point o
 Cyclone --bench-gen-blocks [batches] [threads]    8-lane point-gen only (SHA-block output)
 Cyclone --bench-hash       [batches] [threads]    hash160 only
 Cyclone --bench-hash-blocks[batches] [threads]    hash160 A/B: general vs msg33 SHA compress
-Cyclone --bench-inv        [batches] [threads]    batch inversion only
+Cyclone --bench-inv        [batches] [threads]    batch inversion only (scalar reference)
+Cyclone --bench-overlap    [iters]   [threads]    gen/hash port-overlap probe (diagnostic)
 ```
 
 - `START:END` are **hexadecimal** private keys (inclusive range).
@@ -63,7 +64,8 @@ Cyclone --bench-inv        [batches] [threads]    batch inversion only
 | `--bench-gen` / `--bench-gen-ifma` / `--bench-gen-blocks` | point generation only |
 | `--bench-hash` | AVX-512 SHA-256 + RIPEMD-160 only |
 | `--bench-hash-blocks` | hash160 only — same-binary A/B of general vs msg33-specialized SHA compress |
-| `--bench-inv` | the per-group batch modular inversion only |
+| `--bench-inv` | the per-group batch modular inversion (scalar `ModInv` reference) |
+| `--bench-overlap` | diagnostic — whether gen and hash overlap on the core's execution ports |
 
 The benches share the exact production code paths, and `1/rate_full ~= 1/rate_gen + 1/rate_hash`,
 so the modes let you attribute time precisely.
@@ -100,6 +102,8 @@ neg                   : OK
 normalize             : OK
 mul (IFMA)            : OK
 sqr (IFMA)            : OK
+inv8 (Fermat)         : OK
+batch inversion       : OK
 gen8 plus             : OK
 gen8 minus            : OK
 to_compressed8 (gen8) : OK
@@ -124,8 +128,8 @@ Mode             : FULL-IFMA (8-lane gen + hash)
 Threads          : 1
 Batches/thread   : 30000  (group size 4096)
 Keys processed   : 122880000
-Elapsed          : 9.697 s
-Throughput       : 12.67 Mkeys/s
+Elapsed          : 8.224 s
+Throughput       : 14.94 Mkeys/s
 (checksum sink   : ...)
 ============================================
 ```
@@ -135,16 +139,18 @@ Measured on the development CPU (median of several runs):
 | mode | 1 thread | all threads |
 |---|---:|---:|
 | `--bench` (scalar full) | 6.38 | 70.34 |
-| **`--bench-ifma` (IFMA full)** | **12.67** | **141.83** |
-| `--bench-gen-blocks` (gen only) | ~24.5 | ~265 |
+| **`--bench-ifma` (IFMA full)** | **14.94** | **171.87** |
+| `--bench-gen-blocks` (gen only) | ~33.1 | ~365 |
 | `--bench-hash-blocks` msg33 (hash only) | 27.07 | 321.16 |
 | `--bench-hash-blocks` general (hash only) | 26.76 | 318.76 |
 
-Here `--bench-hash-blocks` isolates the 33-byte-message SHA specialization (general vs `msg33`
-compress, both on the fused path, ~+1%); earlier phases — the in-register SHA transpose and the
-fused SHA->RIPEMD hand-off — landed larger hash gains measured the same way. With all three,
-hashing is no longer the heavier stage — point generation now is — and the overall pipeline reaches
-**~2.0x** the scalar baseline.
+Hashing was optimized first (in-register SHA transpose, fused SHA->RIPEMD hand-off, and the
+33-byte-message SHA specialization that `--bench-hash-blocks` isolates), which made point generation
+the bottleneck. The largest remaining gen cost was the batch inversion — about half of gen time, and
+fully scalar — so it was moved to an 8-lane SIMD Montgomery inversion (`ifma_batchInvert`), lifting
+`--bench-gen-blocks` from ~24.5 to ~33 (1T) and the full pipeline to **~2.4x** the scalar baseline.
+(`--bench-overlap` separately showed gen and hash do **not** overlap on the core's ports — both lean
+on the FMA units — so the two stages stay sequential rather than interleaved.)
 
 ## Production search
 
@@ -185,9 +191,13 @@ periodically so a long run can be monitored.
 
 ## How it works
 
-- **Batch addition trick** — each group of `CPU_GROUP_SIZE = 4096` consecutive keys is generated
-  from one center point using a single modular inverse (`IntGroup::ModInv`) over all the group's
-  x-differences, instead of one inverse per key.
+- **Batch addition trick + SIMD inversion** — each group of `CPU_GROUP_SIZE = 4096` consecutive keys
+  is generated from one center point using a single batch inversion over all the group's
+  x-differences, instead of one inverse per key. That inversion is 8-lane SIMD (`ifma_batchInvert`):
+  the differences are split across 8 lanes run as parallel Montgomery chains sharing one Fermat
+  inverse (`ifma::inv8`, computing `a^(p-2)`), with the bulk inverses kept in SoA and fed straight to
+  `gen8` (no scalar round-trip). The point path keeps the scalar `IntGroup::ModInv` as the self-test
+  reference.
 - **8-lane IFMA field arithmetic** (`ifma_field.h`) — secp256k1 `Fp` in radix-2^52 (5 limbs x 8
   lanes, SoA), with `_mm512_madd52lo/hi_epu64` multiply, a dedicated squaring, and the EC slope
   formula in `gen8`. Points are emitted straight into SHA input blocks (`to_compressed8`), skipping
