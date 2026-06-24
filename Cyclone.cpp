@@ -409,11 +409,10 @@ static inline void storeCompScalar(Point &pt, uint8_t *blk) {
 // once and the buffer relies on persisting across reused groups.
 static inline void hash16Blocks(uint8_t *B, uint8_t outHash[][20]) {
     ALIGN64 uint8_t digest[HASH_BATCH_SIZE][64]; // SHA out / RIPEMD in (RIPEMD pads [32..63])
-    sha256_avx512_16B(
-        B + 0 * 64,  B + 1 * 64,  B + 2 * 64,  B + 3 * 64,
-        B + 4 * 64,  B + 5 * 64,  B + 6 * 64,  B + 7 * 64,
-        B + 8 * 64,  B + 9 * 64,  B + 10 * 64, B + 11 * 64,
-        B + 12 * 64, B + 13 * 64, B + 14 * 64, B + 15 * 64,
+    // B points to 16 contiguous 64-byte blocks, so use the packed SHA entry point
+    // (in-register 16x16 transpose) rather than the scalar byte-gather variant.
+    sha256_avx512_16B_packed(
+        B,
         digest[0],  digest[1],  digest[2],  digest[3],
         digest[4],  digest[5],  digest[6],  digest[7],
         digest[8],  digest[9],  digest[10], digest[11],
