@@ -12,6 +12,12 @@
 //                    by the precomputed jump J at kernel end, so persistent points
 //                    stride perLaunch keys per launch with no re-scalar-mult.
 //
+// The per-point EC generation (gen_pair_and_check) and the hash+compare
+// (record_if_match) are deliberately __noinline__: k_step otherwise inlines all of
+// it and overflows the 255-register ceiling (with spills). Splitting them gives the
+// hash and the EC-gen their own register frames, so the launch register count drops
+// and more blocks fit per SM.
+//
 // Index mapping mirrors the CPU genGroupIFMABlocks: for a batch whose center holds
 // private key `base + i/2`, in-batch index idx in [0,i) holds key `base + idx`:
 //   idx == i/2          : the center point
@@ -36,9 +42,11 @@ struct FoundResult {
 // Target hash160 as 5 little-endian words (set from host via cudaMemcpyToSymbol).
 __constant__ uint32_t c_target[5];
 
-__device__ __forceinline__ void check_candidate(const ec::PointA &P, unsigned idx,
-                                                unsigned slice, unsigned gid,
-                                                FoundResult *res) {
+// Hash a candidate point and, on a target match, record it. Out of line so its
+// SHA/RIPEMD register frame stays separate from k_step's and the EC-gen's.
+__device__ __noinline__ void record_if_match(ec::PointA P, unsigned idx,
+                                             unsigned slice, unsigned gid,
+                                             FoundResult *res) {
     uint32_t h[5];
     h160::hash160_point(P, h);
     if (h[0] == c_target[0] && h[1] == c_target[1] && h[2] == c_target[2] &&
@@ -49,6 +57,21 @@ __device__ __forceinline__ void check_candidate(const ec::PointA &P, unsigned id
 #pragma unroll
             for (int t = 0; t < 5; t++) res->h160[t] = h[t];
         }
+    }
+}
+
+// Generate center - (k+1)*G and (optionally) center + (k+1)*G from the shared
+// inverse, then hash+compare each. Out of line so the EC-gen register frame stays
+// out of k_step. Both points reuse the same inverse (same x-difference).
+__device__ __noinline__ void gen_pair_and_check(ec::PointA C, ec::PointA G, fe::Elem inv,
+                                                unsigned idxMinus, unsigned idxPlus,
+                                                bool hasPlus, unsigned slice, unsigned gid,
+                                                FoundResult *res) {
+    ec::PointA m = ec::ec_batch_add(C.x, C.y, G.x, G.y, inv, false);
+    record_if_match(m, idxMinus, slice, gid, res);
+    if (hasPlus) {
+        ec::PointA p = ec::ec_batch_add(C.x, C.y, G.x, G.y, inv, true);
+        record_if_match(p, idxPlus, slice, gid, res);
     }
 }
 
@@ -91,51 +114,44 @@ __global__ void k_step(ec::PointA *centers, const ec::PointA *__restrict__ Gn,
 
     for (unsigned s = 0; s < slices; s++) {
         if (res->found) break;
-        const fe::Elem Cx = C.x, Cy = C.y;
 
         // forward: prefix[k] = product_{0..k} (Gn[k].x - Cx), advance diff at k=halfI.
-        fe::Elem acc = fe::fe_sub(Gn[0].x, Cx);
+        fe::Elem acc = fe::fe_sub(Gn[0].x, C.x);
         prefix[g] = acc;
         for (unsigned k = 1; k < K; k++) {
             fe::Elem gx = (k < halfI) ? Gn[k].x : iGx;
-            fe::Elem dk = fe::fe_sub(gx, Cx);
+            fe::Elem dk = fe::fe_sub(gx, C.x);
             acc = fe::fe_mul(acc, dk);
             prefix[(uint64_t)k * totalThreads + g] = acc;
         }
         fe::Elem inv = fe::fe_inv(acc);   // 1 / product over all K diffs
 
         // center point (idx = halfI)
-        check_candidate(C, halfI, s, g, res);
+        record_if_match(C, halfI, s, g, res);
 
         // backward: peel each inverse out, generate +/- points / advance.
         ec::PointA newC = C;
         for (unsigned k = K - 1; k >= 1; k--) {
             bool isAdv = (k == halfI);
-            fe::Elem Gx = isAdv ? iGx : Gn[k].x;
-            fe::Elem Gy = isAdv ? iGy : Gn[k].y;
-            fe::Elem dk = fe::fe_sub(Gx, Cx);
+            ec::PointA G;
+            G.x = isAdv ? iGx : Gn[k].x;
+            G.y = isAdv ? iGy : Gn[k].y;
+            fe::Elem dk = fe::fe_sub(G.x, C.x);
             fe::Elem prefkm1 = prefix[(uint64_t)(k - 1) * totalThreads + g];
             fe::Elem invk = fe::fe_mul(prefkm1, inv);   // 1/dk
             inv = fe::fe_mul(inv, dk);                  // peel
             if (isAdv) {
-                newC = ec::ec_batch_add(Cx, Cy, Gx, Gy, invk, true);   // center + i*G
+                newC = ec::ec_batch_add(C.x, C.y, G.x, G.y, invk, true);   // center + i*G
             } else {
-                ec::PointA m = ec::ec_batch_add(Cx, Cy, Gx, Gy, invk, false);
-                check_candidate(m, halfI - (k + 1), s, g, res);        // minus
-                if (k + 1 <= halfI - 1) {                              // plus (if in range)
-                    ec::PointA p = ec::ec_batch_add(Cx, Cy, Gx, Gy, invk, true);
-                    check_candidate(p, halfI + (k + 1), s, g, res);
-                }
+                bool hasPlus = (k + 1 <= halfI - 1);
+                gen_pair_and_check(C, G, invk, halfI - (k + 1), halfI + (k + 1),
+                                   hasPlus, s, g, res);
             }
         }
         // k = 0 (Gn[0] = 1*G): inv now holds 1/d0.
         {
-            ec::PointA m = ec::ec_batch_add(Cx, Cy, Gn[0].x, Gn[0].y, inv, false);
-            check_candidate(m, halfI - 1, s, g, res);                  // idx = halfI-1
-            if (halfI >= 2) {
-                ec::PointA p = ec::ec_batch_add(Cx, Cy, Gn[0].x, Gn[0].y, inv, true);
-                check_candidate(p, halfI + 1, s, g, res);              // idx = halfI+1
-            }
+            ec::PointA G; G.x = Gn[0].x; G.y = Gn[0].y;
+            gen_pair_and_check(C, G, inv, halfI - 1, halfI + 1, (halfI >= 2), s, g, res);
         }
         C = newC;   // advance to next slice's center
     }
