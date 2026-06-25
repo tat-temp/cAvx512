@@ -79,6 +79,26 @@ static inline u256 add_u64(const u256 &a, uint64_t x) {
     return add(a, b);
 }
 
+// a * m (m small; result truncated to 256 bits, fine for in-range offsets).
+static inline u256 mul_u32(const u256 &a, uint32_t m) {
+    u256 r; unsigned __int128 carry = 0;
+    for (int k = 0; k < 4; k++) {
+        unsigned __int128 cur = (unsigned __int128)a.v[k] * m + carry;
+        r.v[k] = (uint64_t)cur; carry = cur >> 64;
+    }
+    return r;
+}
+
+// a / m (m small), quotient only (used to split the range across GPUs).
+static inline u256 div_u32(const u256 &a, uint32_t m) {
+    u256 q; unsigned __int128 rem = 0;
+    for (int k = 3; k >= 0; k--) {
+        unsigned __int128 cur = (rem << 64) | a.v[k];
+        q.v[k] = (uint64_t)(cur / m); rem = cur % m;
+    }
+    return q;
+}
+
 // a - b (assumes a >= b).
 static inline u256 sub(const u256 &a, const u256 &b) {
     u256 r; uint64_t borrow = 0;

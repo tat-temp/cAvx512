@@ -21,6 +21,9 @@
 #include <chrono>
 #include <fstream>
 #include <iostream>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
 #include <cuda_runtime.h>
 
@@ -328,9 +331,63 @@ static uint64_t splitmix64() {
     return z ^ (z >> 31);
 }
 
-static int run_search(const Config &cfg, const u256 &rangeStart, const u256 &rangeSize,
-                      const std::string &targetAddr, const uint8_t targetH160[20],
-                      bool quiet, u256 *foundKeyOut);
+// Shared across the per-GPU worker threads.
+struct MultiState {
+    static const int MAXG = 64;
+    std::atomic<int> found{0};
+    std::atomic<int> doneCount{0};
+    std::mutex mtx;
+    u256 key;
+    unsigned char pub[33];
+    uint32_t h160[5];
+    std::atomic<unsigned long long> checked[MAXG];   // per-device keys done (status only)
+    MultiState() { for (int d = 0; d < MAXG; d++) checked[d].store(0); }
+};
+
+// Search one GPU's contiguous sub-range [subStart, subStart+subSize). Sets the
+// device, builds its own context/buffers/constants, loops launches until its slice
+// is exhausted or any GPU finds the key (shared st->found). No printing -- the
+// orchestrator aggregates status.
+static void search_on_device(int dev, int devIdx, uint64_t gi, uint64_t gj, uint64_t slices,
+                             u256 subStart, u256 subSize, const uint8_t *targetH160,
+                             MultiState *st) {
+    try {
+        CUDA_CHECK(cudaSetDevice(dev));
+        Config cfg = make_config(gi, gj, slices);
+        set_target_words(targetH160);
+        SearchCtx ctx; ctx.cfg = cfg; ctx.alloc(); ctx.build(subStart); ctx.reset_found();
+
+        u256 launchBase;
+        unsigned long long keysDone = 0;
+        while (cmp(launchBase, subSize) < 0) {
+            if (st->found.load(std::memory_order_relaxed)) break;
+            ctx.launch_step();
+            CUDA_CHECK(cudaDeviceSynchronize());
+            search::FoundResult res;
+            CUDA_CHECK(cudaMemcpy(&res, ctx.d_res, sizeof(res), cudaMemcpyDeviceToHost));
+            if (res.found) {
+                uint64_t within = (uint64_t)res.gid * cfg.perThreadKeys
+                                + (uint64_t)res.slice * cfg.i + res.idx;
+                u256 k = add_u64(add(subStart, launchBase), within);
+                int expect = 0;
+                if (st->found.compare_exchange_strong(expect, 1)) {
+                    std::lock_guard<std::mutex> lk(st->mtx);
+                    st->key = k;
+                    for (int t = 0; t < 33; t++) st->pub[t] = res.pub[t];
+                    for (int t = 0; t < 5; t++)  st->h160[t] = res.h160[t];
+                }
+                break;
+            }
+            launchBase = add_u64(launchBase, cfg.perLaunch);
+            keysDone += cfg.perLaunch;
+            st->checked[devIdx].store(keysDone, std::memory_order_relaxed);
+        }
+        ctx.free_all();
+    } catch (const std::exception &ex) {
+        std::fprintf(stderr, "[GPU %d] error: %s\n", dev, ex.what());
+    }
+    st->doneCount.fetch_add(1);
+}
 
 static int run_selftest() {
     std::cout << "============== GPU SELF TEST ==============\n";
@@ -417,16 +474,15 @@ static int run_selftest() {
     int fE2E = 0;
     if (tgt.size()==20) {
         try {
-            Config c = make_config(256, 64, 4);
             u256 rs = u256::from_hex("100000");
             u256 re = u256::from_hex("FFFFFF");
             u256 size = add_u64(sub(re, rs), 1);
-            u256 foundKey;
-            int rc = run_search(c, rs, size, knownAddr, tgt.data(), /*quiet=*/true, &foundKey);
+            MultiState st;
+            search_on_device(0, 0, 256, 64, 4, rs, size, tgt.data(), &st);
             u256 expect = u256::from_hex("ABCDEF");
-            fE2E = (rc==1 && cmp(foundKey, expect)==0) ? 0 : 1;
+            fE2E = (st.found.load() && cmp(st.key, expect) == 0) ? 0 : 1;
             std::cout << "end-to-end search  : " << (fE2E?"FAIL":"OK");
-            if (rc==1) std::cout << " (found " << foundKey.to_hex64().substr(58) << ")";
+            if (st.found.load()) std::cout << " (found " << st.key.to_hex64().substr(58) << ")";
             std::cout << "\n";
         } catch (const std::exception &ex) { fE2E=1; std::cout << "end-to-end search  : FAIL ("<<ex.what()<<")\n"; }
     } else { fE2E=1; std::cout << "end-to-end search  : SKIP (address decode failed)\n"; }
@@ -438,84 +494,85 @@ static int run_selftest() {
 }
 
 // ============================================================================
-// Search driver (shared by production and the end-to-end self-test)
+// Multi-GPU search driver: split the range into N contiguous sub-ranges, one host
+// thread per GPU, shared found-flag, aggregated status.
 // ============================================================================
-static int run_search(const Config &cfg, const u256 &rangeStart, const u256 &rangeSize,
-                      const std::string &targetAddr, const uint8_t targetH160[20],
-                      bool quiet, u256 *foundKeyOut) {
-    set_target_words(targetH160);
-    SearchCtx ctx; ctx.cfg = cfg; ctx.alloc(); ctx.build(rangeStart); ctx.reset_found();
+static int run_search_multi(const std::vector<int> &devs, const u256 &rangeStart,
+                            const u256 &rangeSize, const std::string &targetAddr,
+                            const uint8_t targetH160[20], uint64_t gi, uint64_t gj, uint64_t slices) {
+    const int N = (int)devs.size();
+    if (N > MultiState::MAXG) { std::fprintf(stderr, "too many GPUs (max %d)\n", MultiState::MAXG); return 1; }
+    cudaSetDevice(devs[0]);
+    (void)make_config(gi, gj, slices);   // validate grid args on the main thread (throws on bad)
 
-    int dev; cudaGetDevice(&dev); cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev);
-    if (!quiet) {
-        std::cout << "GPU            : " << prop.name << " (" << prop.multiProcessorCount << " SMs)\n";
-        std::cout << "Grid           : " << cfg.numBlocks << " blocks x " << cfg.j
-                  << " threads,  i=" << cfg.i << "  slices=" << cfg.slices << "\n";
-        std::cout << "Keys/launch    : " << cfg.perLaunch << "\n\n";
+    MultiState st;
+    u256 chunk = div_u32(rangeSize, (uint32_t)N);
+    std::vector<u256> subStart(N), subSize(N);
+    for (int d = 0; d < N; d++) {
+        u256 off = mul_u32(chunk, (uint32_t)d);
+        subStart[d] = add(rangeStart, off);
+        subSize[d]  = (d == N - 1) ? sub(rangeSize, off) : chunk;
     }
 
-    u256 launchBase;                         // offset of the current launch from rangeStart
+    std::cout << "================= CYCLONE GPU =================\n";
+    std::cout << "Target Address : " << targetAddr << "\n";
+    for (int d = 0; d < N; d++) {
+        cudaSetDevice(devs[d]); cudaDeviceProp p; cudaGetDeviceProperties(&p, devs[d]);
+        std::cout << "GPU " << devs[d] << "          : " << p.name << "  ["
+                  << subStart[d].to_hex64() << " +" << subSize[d].to_hex64() << ")\n";
+    }
+    std::cout << "Grid           : i=" << gi << " j=" << gj << " slices=" << slices
+              << "  (" << N << " GPU" << (N > 1 ? "s" : "") << ")\n\n";
+
     auto t0 = std::chrono::high_resolution_clock::now();
-    auto lastStatus = t0, lastSave = t0;
+    std::vector<std::thread> threads;
+    for (int d = 0; d < N; d++)
+        threads.emplace_back(search_on_device, devs[d], d, gi, gj, slices,
+                             subStart[d], subSize[d], targetH160, &st);
+
     long double sizeLD = to_long_double(rangeSize);
-    int result = 0;
-
-    while (cmp(launchBase, rangeSize) < 0) {
-        ctx.launch_step();
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        search::FoundResult res;
-        CUDA_CHECK(cudaMemcpy(&res, ctx.d_res, sizeof(res), cudaMemcpyDeviceToHost));
-        if (res.found) {
-            uint64_t within = (uint64_t)res.gid * cfg.perThreadKeys
-                            + (uint64_t)res.slice * cfg.i + res.idx;
-            u256 key = add_u64(add(rangeStart, launchBase), within);
-            if (foundKeyOut) *foundKeyOut = key;
-            if (!quiet) {
-                uint8_t mb[20]; h160_words_to_bytes(res.h160, mb);
-                std::string priv = key.to_hex64();
-                uint8_t pk[32]; key.to_bytes_be(pk);
-                std::string wif = hosth::to_wif(pk, true);
-                std::string pub = bytes_to_hex(res.pub, 33);
-                std::string addr = hosth::hash160_to_address(mb);
-                std::cout << "\n================== FOUND MATCH! ==================\n";
-                std::cout << "Private Key   : " << priv << "\n";
-                std::cout << "Public Key    : " << pub << "\n";
-                std::cout << "WIF           : " << wif << "\n";
-                std::cout << "P2PKH Address : " << addr << "\n";
-                std::cout << "Verify        : " << (addr==targetAddr ? "OK (address matches)" : "MISMATCH") << "\n";
-                std::ofstream ofs("found_keys.txt", std::ios::app);
-                if (ofs) ofs << priv << ' ' << pub << ' ' << wif << ' ' << addr << "\n";
-            }
-            result = 1;
-            break;
+    auto lastStatus = t0, lastSave = t0;
+    while (st.found.load() == 0 && st.doneCount.load() < N) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        auto now = std::chrono::high_resolution_clock::now();
+        if (std::chrono::duration<double>(now - lastStatus).count() >= 5.0) {
+            unsigned long long total = 0; for (int d = 0; d < N; d++) total += st.checked[d].load(std::memory_order_relaxed);
+            double el = std::chrono::duration<double>(now - t0).count();
+            double mk = el > 0 ? (double)total / 1e6 / el : 0.0;
+            long double pct = sizeLD > 0 ? ((long double)total / sizeLD * 100.0L) : 0.0L;
+            std::printf("\rMkeys/s %.2f | checked %llu | %s | %.4Lf%%      ",
+                        mk, total, fmt_elapsed(el).c_str(), pct);
+            std::fflush(stdout);
+            lastStatus = now;
         }
-
-        launchBase = add_u64(launchBase, cfg.perLaunch);
-
-        if (!quiet) {
-            auto now = std::chrono::high_resolution_clock::now();
-            if (std::chrono::duration<double>(now - lastStatus).count() >= 5.0) {
-                double el = std::chrono::duration<double>(now - t0).count();
-                long double doneLD = to_long_double(launchBase);
-                double mk = el > 0 ? (double)(doneLD / 1e6 / el) : 0.0;
-                long double pct = sizeLD > 0 ? (doneLD / sizeLD * 100.0L) : 0.0L;
-                std::printf("\rMkeys/s %.2f | checked %.0Lf | %s | %.4Lf%%      ",
-                            mk, doneLD, fmt_elapsed(el).c_str(), pct);
-                std::fflush(stdout);
-                lastStatus = now;
-            }
-            if (std::chrono::duration<double>(now - lastSave).count() >= 300.0) {
-                std::ofstream ofs("progress.txt", std::ios::app);
-                if (ofs) ofs << "checked=" << launchBase.to_hex64() << "\n";
-                lastSave = now;
-            }
+        if (std::chrono::duration<double>(now - lastSave).count() >= 300.0) {
+            unsigned long long total = 0; for (int d = 0; d < N; d++) total += st.checked[d].load(std::memory_order_relaxed);
+            std::ofstream ofs("progress.txt", std::ios::app);
+            if (ofs) ofs << "checked=" << total << "\n";
+            lastSave = now;
         }
     }
+    for (auto &th : threads) th.join();
 
-    if (!quiet && !result) std::cout << "\nNo match found in range.\n";
-    ctx.free_all();
-    return result;
+    if (st.found.load()) {
+        uint8_t mb[20]; h160_words_to_bytes(st.h160, mb);
+        std::string priv = st.key.to_hex64();
+        uint8_t pk[32]; st.key.to_bytes_be(pk);
+        std::string wif = hosth::to_wif(pk, true);
+        std::string pub = bytes_to_hex(st.pub, 33);
+        std::string addr = hosth::hash160_to_address(mb);
+        std::cout << "\n================== FOUND MATCH! ==================\n";
+        std::cout << "Private Key   : " << priv << "\n";
+        std::cout << "Public Key    : " << pub << "\n";
+        std::cout << "WIF           : " << wif << "\n";
+        std::cout << "P2PKH Address : " << addr << "\n";
+        std::cout << "Verify        : " << (addr == targetAddr ? "OK (address matches)" : "MISMATCH") << "\n";
+        std::ofstream ofs("found_keys.txt", std::ios::app);
+        if (ofs) ofs << priv << ' ' << pub << ' ' << wif << ' ' << addr << "\n";
+        return 1;
+    }
+    std::cout << "\nNo match found in range.\n";
+    return 0;
 }
 
 // ============================================================================
@@ -565,7 +622,20 @@ static void usage(const char *p) {
         "  %s --bench [launches] [--grid i,j] [--slices N]      full pipeline\n"
         "  %s --bench-gen [launches] [--grid i,j] [--slices N]  EC+Montgomery only (no hash)\n"
         "    --grid i,j : i = keys per batch per thread (power of 2), j = threads per block\n"
-        "    --slices N : batches per thread per kernel launch\n", p, p, p, p);
+        "    --slices N : batches per thread per kernel launch\n"
+        "    --gpus a,b : comma-separated device ids to use for search (default: all)\n", p, p, p, p);
+}
+
+// Parse a comma-separated device-id list into out.
+static void parse_gpus(const char *s, std::vector<int> &out) {
+    const char *p = s;
+    while (*p) {
+        char *end = nullptr;
+        long v = std::strtol(p, &end, 10);
+        if (end == p) break;
+        out.push_back((int)v);
+        p = (*end == ',') ? end + 1 : end;
+    }
 }
 
 static bool parse_grid(const char *s, uint64_t &i, uint64_t &j) {
@@ -585,6 +655,7 @@ int main(int argc, char **argv) {
     int launches = 10;
     uint64_t gi = 512, gj = 256, slices = 16;   // bench defaults
     std::string addr, range;
+    std::vector<int> gpuList;
     bool haveAddr = false, haveRange = false, haveGrid = false, haveSlices = false;
 
     for (int a = 1; a < argc; a++) {
@@ -602,13 +673,19 @@ int main(int argc, char **argv) {
             haveGrid = true;
         } else if (s == "--slices" && a + 1 < argc) {
             slices = std::strtoull(argv[++a], nullptr, 10); haveSlices = true;
+        } else if (s == "--gpus" && a + 1 < argc) {
+            parse_gpus(argv[++a], gpuList);
         } else {
             std::fprintf(stderr, "Unknown/!incomplete argument: %s\n", argv[a]); usage(argv[0]); return 1;
         }
     }
 
     try {
-        if (bench) { run_bench(gi, gj, slices, launches, benchGen); return 0; }
+        if (bench) {
+            if (!gpuList.empty()) CUDA_CHECK(cudaSetDevice(gpuList[0]));
+            run_bench(gi, gj, slices, launches, benchGen);
+            return 0;
+        }
 
         if (!haveAddr || !haveRange || !haveGrid || !haveSlices) {
             std::fprintf(stderr, "search needs -a, -r, --grid i,j and --slices N\n");
@@ -624,11 +701,19 @@ int main(int argc, char **argv) {
         std::vector<uint8_t> h160 = hosth::address_to_hash160(addr);
         if (h160.size() != 20) { std::fprintf(stderr, "address decode failed\n"); return 1; }
 
-        Config cfg = make_config(gi, gj, slices);
-        std::cout << "================= CYCLONE GPU =================\n";
-        std::cout << "Target Address : " << addr << "\n";
-        std::cout << "Range          : " << rs.to_hex64() << " : " << re.to_hex64() << "\n";
-        int rc = run_search(cfg, rs, size, addr, h160.data(), /*quiet=*/false, nullptr);
+        int devCount = 0; CUDA_CHECK(cudaGetDeviceCount(&devCount));
+        if (devCount <= 0) { std::fprintf(stderr, "no CUDA devices found\n"); return 1; }
+        std::vector<int> devs = gpuList;
+        if (devs.empty()) {                       // default: all visible GPUs
+            for (int d = 0; d < devCount; d++) devs.push_back(d);
+        } else {
+            for (int d : devs)
+                if (d < 0 || d >= devCount) {
+                    std::fprintf(stderr, "invalid --gpus id %d (have %d device(s))\n", d, devCount);
+                    return 1;
+                }
+        }
+        int rc = run_search_multi(devs, rs, size, addr, h160.data(), gi, gj, slices);
         return rc == 1 ? 0 : 2;
     } catch (const std::exception &ex) {
         std::fprintf(stderr, "Error: %s\n", ex.what());

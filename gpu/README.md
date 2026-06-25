@@ -41,9 +41,9 @@ This must print `GPU SELFTEST PASSED`. It checks, bottom-up:
 ## Usage
 
 ```
-cyclone_gpu -a <Base58_P2PKH> -r <START:END> --grid i,j --slices N
+cyclone_gpu -a <Base58_P2PKH> -r <START:END> --grid i,j --slices N [--gpus a,b,...]
 cyclone_gpu --selftest
-cyclone_gpu --bench [launches] [--grid i,j] [--slices N]
+cyclone_gpu --bench [launches] [--grid i,j] [--slices N] [--gpus d]
 ```
 
 - `-a, --address` — target mainnet P2PKH (compressed) Base58 address.
@@ -52,10 +52,15 @@ cyclone_gpu --bench [launches] [--grid i,j] [--slices N]
   group size, like the CPU's `CPU_GROUP_SIZE`); **j** = threads per block.
 - `--slices N` — batches each thread runs per kernel launch (amortizes launch and
   setup cost).
+- `--gpus a,b,...` — device ids to use (default: **all** visible GPUs). The range is
+  split into one contiguous sub-range per GPU, each driven by its own host thread;
+  progress is aggregated into one status line and the first GPU to hit the key wins.
+  For `--bench`, only the first listed id is used.
 
-The **number of blocks is auto-sized** to fill the GPU (occupancy × SM count).
-Override with `CYCLONE_BLOCKS=<n>`. Keys processed per launch =
-`blocks × j × i × slices`.
+The **number of blocks is auto-sized** per GPU to fill it (occupancy × SM count).
+Override with `CYCLONE_BLOCKS=<n>`. Keys processed per launch per GPU =
+`blocks × j × i × slices`. Scaling across identical GPUs is ~linear (independent
+sub-ranges, no cross-device coordination).
 
 Self-verifying sample (same key/address as the CPU README):
 

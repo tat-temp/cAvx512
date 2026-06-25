@@ -1,6 +1,6 @@
 NVCC      ?= nvcc
 ARCH      ?= sm_120
-NVCCFLAGS ?= -O3 -arch=$(ARCH)
+NVCCFLAGS ?= -O3 -arch=$(ARCH) -Xcompiler -pthread
 
 HEADERS = field.cuh ec.cuh sha256.cuh ripemd160.cuh hash160.cuh search.cuh \
           u256.h host_hash.h
