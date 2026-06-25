@@ -44,9 +44,16 @@ __constant__ uint32_t c_target[5];
 
 // Hash a candidate point and, on a target match, record it. Out of line so its
 // SHA/RIPEMD register frame stays separate from k_step's and the EC-gen's.
+// DO_HASH=false is the gen-only bench path: it skips hashing but keeps the point
+// live (sink) so the EC generation isn't optimized away -- isolating hash cost.
+template <bool DO_HASH>
 __device__ __noinline__ void record_if_match(ec::PointA P, unsigned idx,
                                              unsigned slice, unsigned gid,
                                              FoundResult *res) {
+    if (!DO_HASH) {
+        if (P.x.v[0] == ~0ULL && P.y.v[0] == ~0ULL) atomicAdd(&res->found, 1u);
+        return;
+    }
     uint32_t h[5];
     h160::hash160_point(P, h);
     if (h[0] == c_target[0] && h[1] == c_target[1] && h[2] == c_target[2] &&
@@ -63,15 +70,16 @@ __device__ __noinline__ void record_if_match(ec::PointA P, unsigned idx,
 // Generate center - (k+1)*G and (optionally) center + (k+1)*G from the shared
 // inverse, then hash+compare each. Out of line so the EC-gen register frame stays
 // out of k_step. Both points reuse the same inverse (same x-difference).
+template <bool DO_HASH>
 __device__ __noinline__ void gen_pair_and_check(ec::PointA C, ec::PointA G, fe::Elem inv,
                                                 unsigned idxMinus, unsigned idxPlus,
                                                 bool hasPlus, unsigned slice, unsigned gid,
                                                 FoundResult *res) {
     ec::PointA m = ec::ec_batch_add(C.x, C.y, G.x, G.y, inv, false);
-    record_if_match(m, idxMinus, slice, gid, res);
+    record_if_match<DO_HASH>(m, idxMinus, slice, gid, res);
     if (hasPlus) {
         ec::PointA p = ec::ec_batch_add(C.x, C.y, G.x, G.y, inv, true);
-        record_if_match(p, idxPlus, slice, gid, res);
+        record_if_match<DO_HASH>(p, idxPlus, slice, gid, res);
     }
 }
 
@@ -101,6 +109,7 @@ __global__ void k_build_gn(ec::PointA *Gn, unsigned halfI, ec::PointA *special,
     if (k == 1) { uint64_t js[4] = {j0, j1, j2, j3}; special[1] = ec::ec_scalarmul(js, G); }
 }
 
+template <bool DO_HASH>
 __global__ void k_step(ec::PointA *centers, const ec::PointA *__restrict__ Gn,
                        const ec::PointA *__restrict__ special, fe::Elem *prefix,
                        unsigned totalThreads, unsigned halfI, unsigned slices,
@@ -127,7 +136,7 @@ __global__ void k_step(ec::PointA *centers, const ec::PointA *__restrict__ Gn,
         fe::Elem inv = fe::fe_inv(acc);   // 1 / product over all K diffs
 
         // center point (idx = halfI)
-        record_if_match(C, halfI, s, g, res);
+        record_if_match<DO_HASH>(C, halfI, s, g, res);
 
         // backward: peel each inverse out, generate +/- points / advance.
         ec::PointA newC = C;
@@ -144,14 +153,14 @@ __global__ void k_step(ec::PointA *centers, const ec::PointA *__restrict__ Gn,
                 newC = ec::ec_batch_add(C.x, C.y, G.x, G.y, invk, true);   // center + i*G
             } else {
                 bool hasPlus = (k + 1 <= halfI - 1);
-                gen_pair_and_check(C, G, invk, halfI - (k + 1), halfI + (k + 1),
+                gen_pair_and_check<DO_HASH>(C, G, invk, halfI - (k + 1), halfI + (k + 1),
                                    hasPlus, s, g, res);
             }
         }
         // k = 0 (Gn[0] = 1*G): inv now holds 1/d0.
         {
             ec::PointA G; G.x = Gn[0].x; G.y = Gn[0].y;
-            gen_pair_and_check(C, G, inv, halfI - 1, halfI + 1, (halfI >= 2), s, g, res);
+            gen_pair_and_check<DO_HASH>(C, G, inv, halfI - 1, halfI + 1, (halfI >= 2), s, g, res);
         }
         C = newC;   // advance to next slice's center
     }

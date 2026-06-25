@@ -204,7 +204,7 @@ static Config make_config(uint64_t i, uint64_t j, uint64_t slices) {
     int dev; CUDA_CHECK(cudaGetDevice(&dev));
     cudaDeviceProp prop; CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
     int blocksPerSM = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSM, search::k_step, (int)j, 0));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSM, search::k_step<true>, (int)j, 0));
     if (blocksPerSM < 1) blocksPerSM = 1;
     unsigned numBlocks = (unsigned)blocksPerSM * (unsigned)prop.multiProcessorCount;
     if (const char *e = std::getenv("CYCLONE_BLOCKS")) { int v = std::atoi(e); if (v > 0) numBlocks = (unsigned)v; }
@@ -269,9 +269,13 @@ struct SearchCtx {
 
     void reset_found() { CUDA_CHECK(cudaMemset(d_res, 0, sizeof(search::FoundResult))); }
 
-    void launch_step() {
-        search::k_step<<<cfg.numBlocks, (unsigned)cfg.j>>>(d_centers, d_Gn, d_special, d_prefix,
-            (unsigned)cfg.totalThreads, (unsigned)cfg.halfI, (unsigned)cfg.slices, d_res);
+    void launch_step(bool genOnly = false) {
+        if (genOnly)
+            search::k_step<false><<<cfg.numBlocks, (unsigned)cfg.j>>>(d_centers, d_Gn, d_special, d_prefix,
+                (unsigned)cfg.totalThreads, (unsigned)cfg.halfI, (unsigned)cfg.slices, d_res);
+        else
+            search::k_step<true><<<cfg.numBlocks, (unsigned)cfg.j>>>(d_centers, d_Gn, d_special, d_prefix,
+                (unsigned)cfg.totalThreads, (unsigned)cfg.halfI, (unsigned)cfg.slices, d_res);
         CUDA_CHECK(cudaGetLastError());
     }
 };
@@ -512,7 +516,7 @@ static int run_search(const Config &cfg, const u256 &rangeStart, const u256 &ran
 // ============================================================================
 // Benchmark
 // ============================================================================
-static void run_bench(uint64_t i, uint64_t j, uint64_t slices, int launches) {
+static void run_bench(uint64_t i, uint64_t j, uint64_t slices, int launches, bool genOnly) {
     Config cfg = make_config(i, j, slices);
     int dev; cudaGetDevice(&dev); cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev);
 
@@ -522,9 +526,9 @@ static void run_bench(uint64_t i, uint64_t j, uint64_t slices, int launches) {
     u256 rs = u256::from_hex("8000000000000000");   // arbitrary high start
     ctx.build(rs); ctx.reset_found();
 
-    ctx.launch_step(); CUDA_CHECK(cudaDeviceSynchronize());   // warm
+    ctx.launch_step(genOnly); CUDA_CHECK(cudaDeviceSynchronize());   // warm
     auto t0 = std::chrono::high_resolution_clock::now();
-    for (int l = 0; l < launches; l++) ctx.launch_step();
+    for (int l = 0; l < launches; l++) ctx.launch_step(genOnly);
     CUDA_CHECK(cudaDeviceSynchronize());
     auto t1 = std::chrono::high_resolution_clock::now();
     double secs = std::chrono::duration<double>(t1 - t0).count();
@@ -533,6 +537,8 @@ static void run_bench(uint64_t i, uint64_t j, uint64_t slices, int launches) {
 
     std::cout << "================= GPU BENCHMARK =================\n";
     std::cout << "GPU            : " << prop.name << "\n";
+    std::cout << "Mode           : " << (genOnly ? "GEN-ONLY (EC + Montgomery, no hash)"
+                                                 : "FULL (gen + hash160)") << "\n";
     std::cout << "Grid           : " << cfg.numBlocks << " x " << cfg.j
               << "  i=" << cfg.i << "  slices=" << cfg.slices << "\n";
     std::cout << "Keys/launch    : " << cfg.perLaunch << "\n";
@@ -551,9 +557,10 @@ static void usage(const char *p) {
         "Usage:\n"
         "  %s -a <Base58_P2PKH> -r <START:END> --grid i,j --slices N\n"
         "  %s --selftest\n"
-        "  %s --bench [launches] [--grid i,j] [--slices N]\n"
+        "  %s --bench [launches] [--grid i,j] [--slices N]      full pipeline\n"
+        "  %s --bench-gen [launches] [--grid i,j] [--slices N]  EC+Montgomery only (no hash)\n"
         "    --grid i,j : i = keys per batch per thread (power of 2), j = threads per block\n"
-        "    --slices N : batches per thread per kernel launch\n", p, p, p);
+        "    --slices N : batches per thread per kernel launch\n", p, p, p, p);
 }
 
 static bool parse_grid(const char *s, uint64_t &i, uint64_t &j) {
@@ -569,7 +576,7 @@ int main(int argc, char **argv) {
 
     for (int a = 1; a < argc; a++) if (!std::strcmp(argv[a], "--selftest")) return run_selftest();
 
-    bool bench = false;
+    bool bench = false, benchGen = false;
     int launches = 10;
     uint64_t gi = 512, gj = 256, slices = 16;   // bench defaults
     std::string addr, range;
@@ -577,8 +584,9 @@ int main(int argc, char **argv) {
 
     for (int a = 1; a < argc; a++) {
         std::string s = argv[a];
-        if (s == "--bench") {
+        if (s == "--bench" || s == "--bench-gen") {
             bench = true;
+            benchGen = (s == "--bench-gen");
             if (a + 1 < argc && argv[a+1][0] != '-') launches = std::atoi(argv[++a]);
         } else if ((s == "-a" || s == "--address") && a + 1 < argc) {
             addr = argv[++a]; haveAddr = true;
@@ -595,7 +603,7 @@ int main(int argc, char **argv) {
     }
 
     try {
-        if (bench) { run_bench(gi, gj, slices, launches); return 0; }
+        if (bench) { run_bench(gi, gj, slices, launches, benchGen); return 0; }
 
         if (!haveAddr || !haveRange || !haveGrid || !haveSlices) {
             std::fprintf(stderr, "search needs -a, -r, --grid i,j and --slices N\n");
