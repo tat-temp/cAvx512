@@ -11,6 +11,10 @@ in-register and the SHA-256 -> RIPEMD-160 hand-off fused (skipping the intermedi
 On a representative AVX-512/IFMA CPU this runs at **~15 MKeys/s single-thread** and **~175 MKeys/s**
 across all cores — about **2.4x** the original scalar implementation.
 
+> **GPU port:** a self-contained CUDA implementation for NVIDIA Blackwell (RTX 5090, `sm_120`)
+> lives in [`gpu/`](gpu/) — **~7.4 GKeys/s per GPU** with multi-GPU support. See
+> [`gpu/README.md`](gpu/README.md).
+
 > The software is developed for solving Satoshi's puzzles; any use for illegal purposes is strictly
 > prohibited. The author is not responsible for any actions taken by the user when using this
 > software for unlawful activities.
