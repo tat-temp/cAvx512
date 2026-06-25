@@ -67,62 +67,75 @@ __device__ __forceinline__ uint64_t sub4(const uint64_t a[4], const uint64_t b[4
     return borrow;
 }
 
-// 256x256 -> 512 schoolbook (operand scanning) via unsigned __int128, so nvcc
-// emits native mad.lo/hi.cc + addc carry chains. The running (a*b + limb + carry)
-// total is <= 2^128-1, so the high word never overflows.
+// 256x256 -> 512 schoolbook on 8x32-bit limbs. Each partial product is
+// (uint64)(uint32 * uint32), which nvcc emits as a single native mul.wide.u32
+// (IMAD.WIDE) -- far cheaper than the emulated mul.hi.u64 a 4x64 schoolbook needs.
+// 64-bit accumulation handles carries; (a*b + limb + carry) <= 2^64-1, no overflow.
+// Output is repacked to 4 x 64-bit limbs for the (unchanged) 64-bit reduce().
 __device__ __forceinline__ void mul256(const uint64_t a[4], const uint64_t b[4],
                                         uint64_t r[8]) {
+    uint32_t A[8], B[8];
 #pragma unroll
-    for (int k = 0; k < 8; k++) r[k] = 0;
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        unsigned __int128 carry = 0;
-#pragma unroll
-        for (int j = 0; j < 4; j++) {
-            unsigned __int128 cur = (unsigned __int128)a[i] * b[j]
-                                  + (unsigned __int128)r[i + j] + carry;
-            r[i + j] = (uint64_t)cur;
-            carry = cur >> 64;
-        }
-        r[i + 4] = (uint64_t)carry;
+    for (int k = 0; k < 4; k++) {
+        A[2*k] = (uint32_t)a[k]; A[2*k+1] = (uint32_t)(a[k] >> 32);
+        B[2*k] = (uint32_t)b[k]; B[2*k+1] = (uint32_t)(b[k] >> 32);
     }
+    uint32_t T[16];
+#pragma unroll
+    for (int k = 0; k < 16; k++) T[k] = 0;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        uint64_t carry = 0;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            uint64_t cur = (uint64_t)A[i] * B[j] + T[i + j] + carry;
+            T[i + j] = (uint32_t)cur; carry = cur >> 32;
+        }
+        T[i + 8] = (uint32_t)carry;
+    }
+#pragma unroll
+    for (int k = 0; k < 8; k++) r[k] = (uint64_t)T[2*k] | ((uint64_t)T[2*k+1] << 32);
 }
 
-// 256-bit squaring -> 512, BRANCHLESS (no data-dependent carry ripple, so no warp
-// divergence). Upper-triangle cross products via operand scanning -- carries flow
-// in the fixed, fully-unrolled inner loops -- then double, then add the diagonal
-// squares with a single fixed carry sweep (each diagonal occupies limbs 2i,2i+1, so
-// one carry threads straight into the next). 10 multiplies, same as the prior
-// triangle form, but with zero data-dependent control flow. Square is < 2^512 and
-// only additions accumulate, so the top limb never overflows.
-__device__ __forceinline__ void sqr256(const uint64_t a[4], uint64_t t[8]) {
-    uint64_t cr[8];
+// 256-bit squaring -> 512 on 8x32-bit limbs, branchless (no data-dependent ripple).
+// Native mul.wide.u32 partial products (see mul256). Upper-triangle cross products
+// via operand scanning, doubled, then diagonal squares a_i^2 at limb 2i added with a
+// single fixed carry sweep (each diagonal spans limbs 2i,2i+1, so one carry threads
+// into the next). 28 cross + 8 diagonal = 36 native 32-bit muls. Output repacked to
+// 4 x 64-bit for the (unchanged) 64-bit reduce().
+__device__ __forceinline__ void sqr256(const uint64_t a[4], uint64_t r[8]) {
+    uint32_t A[8];
 #pragma unroll
-    for (int k = 0; k < 8; k++) cr[k] = 0;
+    for (int k = 0; k < 4; k++) { A[2*k] = (uint32_t)a[k]; A[2*k+1] = (uint32_t)(a[k] >> 32); }
+    uint32_t cr[16];
 #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        unsigned __int128 carry = 0;
+    for (int k = 0; k < 16; k++) cr[k] = 0;
 #pragma unroll
-        for (int j = i + 1; j < 4; j++) {
-            unsigned __int128 cur = (unsigned __int128)a[i] * a[j] + cr[i + j] + carry;
-            cr[i + j] = (uint64_t)cur;
-            carry = cur >> 64;
+    for (int i = 0; i < 8; i++) {
+        uint64_t carry = 0;
+#pragma unroll
+        for (int j = i + 1; j < 8; j++) {
+            uint64_t cur = (uint64_t)A[i] * A[j] + cr[i + j] + carry;
+            cr[i + j] = (uint32_t)cur; carry = cur >> 32;
         }
-        cr[i + 4] = (uint64_t)carry;
+        cr[i + 8] = (uint32_t)carry;
     }
-    uint64_t hi = 0;                        // t = 2 * cr
+    uint32_t T[16];
+    uint32_t hi = 0;                        // T = 2 * cr
 #pragma unroll
-    for (int k = 0; k < 8; k++) { uint64_t nc = cr[k] >> 63; t[k] = (cr[k] << 1) | hi; hi = nc; }
+    for (int k = 0; k < 16; k++) { uint32_t nc = cr[k] >> 31; T[k] = (cr[k] << 1) | hi; hi = nc; }
     uint64_t carry = 0;                     // + diagonal squares a_i^2 at limb 2i
 #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        unsigned __int128 sq = (unsigned __int128)a[i] * a[i];
-        unsigned __int128 cur = (unsigned __int128)t[2 * i] + (uint64_t)sq + carry;
-        t[2 * i] = (uint64_t)cur;
-        cur = (unsigned __int128)t[2 * i + 1] + (uint64_t)(sq >> 64) + (uint64_t)(cur >> 64);
-        t[2 * i + 1] = (uint64_t)cur;
-        carry = (uint64_t)(cur >> 64);
+    for (int i = 0; i < 8; i++) {
+        uint64_t sq = (uint64_t)A[i] * A[i];
+        uint64_t cur = (uint64_t)T[2*i] + (uint32_t)sq + carry;
+        T[2*i] = (uint32_t)cur;
+        cur = (uint64_t)T[2*i + 1] + (uint32_t)(sq >> 32) + (uint32_t)(cur >> 32);
+        T[2*i + 1] = (uint32_t)cur;
+        carry = (uint32_t)(cur >> 32);
     }
+#pragma unroll
+    for (int k = 0; k < 8; k++) r[k] = (uint64_t)T[2*k] | ((uint64_t)T[2*k+1] << 32);
 }
 
 // value (carry:r) is < 2p; subtract p once (branchless) to land in [0, p).
