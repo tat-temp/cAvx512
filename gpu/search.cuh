@@ -42,6 +42,12 @@ struct FoundResult {
 // Target hash160 as 5 little-endian words (set from host via cudaMemcpyToSymbol).
 __constant__ uint32_t c_target[5];
 
+// Generator table in constant memory: Gn[k] is read with UNIFORM k across the warp,
+// the ideal case for the constant-cache broadcast path. Used when i/2 <= 512 (fits
+// 32KB); larger i falls back to the global Gn argument (USE_CGN=false).
+#define MAXC_GN 512
+__constant__ ec::PointA c_Gn[MAXC_GN];
+
 // Hash a candidate point and, on a target match, record it. Out of line so its
 // SHA/RIPEMD register frame stays separate from k_step's and the EC-gen's.
 // DO_HASH=false is the gen-only bench path: it skips hashing but keeps the point
@@ -109,7 +115,12 @@ __global__ void k_build_gn(ec::PointA *Gn, unsigned halfI, ec::PointA *special,
     if (k == 1) { uint64_t js[4] = {j0, j1, j2, j3}; special[1] = ec::ec_scalarmul(js, G); }
 }
 
-template <bool DO_HASH>
+// Generator-table accessors: constant-memory broadcast (USE_CGN) or global. USE_CGN
+// is a compile-time template arg, so the dead branch is eliminated.
+#define CGNX(k) (USE_CGN ? c_Gn[k].x : Gn[k].x)
+#define CGNY(k) (USE_CGN ? c_Gn[k].y : Gn[k].y)
+
+template <bool DO_HASH, bool USE_CGN>
 __global__ void k_step(ec::PointA *centers, const ec::PointA *__restrict__ Gn,
                        const ec::PointA *__restrict__ special, fe::Elem *prefix,
                        unsigned totalThreads, unsigned halfI, unsigned slices,
@@ -125,10 +136,10 @@ __global__ void k_step(ec::PointA *centers, const ec::PointA *__restrict__ Gn,
         if (res->found) break;
 
         // forward: prefix[k] = product_{0..k} (Gn[k].x - Cx), advance diff at k=halfI.
-        fe::Elem acc = fe::fe_sub(Gn[0].x, C.x);
+        fe::Elem acc = fe::fe_sub(CGNX(0), C.x);
         prefix[g] = acc;
         for (unsigned k = 1; k < K; k++) {
-            fe::Elem gx = (k < halfI) ? Gn[k].x : iGx;
+            fe::Elem gx = (k < halfI) ? CGNX(k) : iGx;
             fe::Elem dk = fe::fe_sub(gx, C.x);
             acc = fe::fe_mul(acc, dk);
             prefix[(uint64_t)k * totalThreads + g] = acc;
@@ -143,8 +154,8 @@ __global__ void k_step(ec::PointA *centers, const ec::PointA *__restrict__ Gn,
         for (unsigned k = K - 1; k >= 1; k--) {
             bool isAdv = (k == halfI);
             ec::PointA G;
-            G.x = isAdv ? iGx : Gn[k].x;
-            G.y = isAdv ? iGy : Gn[k].y;
+            G.x = isAdv ? iGx : CGNX(k);
+            G.y = isAdv ? iGy : CGNY(k);
             fe::Elem dk = fe::fe_sub(G.x, C.x);
             fe::Elem prefkm1 = prefix[(uint64_t)(k - 1) * totalThreads + g];
             fe::Elem invk = fe::fe_mul(prefkm1, inv);   // 1/dk
@@ -159,7 +170,7 @@ __global__ void k_step(ec::PointA *centers, const ec::PointA *__restrict__ Gn,
         }
         // k = 0 (Gn[0] = 1*G): inv now holds 1/d0.
         {
-            ec::PointA G; G.x = Gn[0].x; G.y = Gn[0].y;
+            ec::PointA G; G.x = CGNX(0); G.y = CGNY(0);
             gen_pair_and_check<DO_HASH>(C, G, inv, halfI - 1, halfI + 1, (halfI >= 2), s, g, res);
         }
         C = newC;   // advance to next slice's center
@@ -169,5 +180,7 @@ __global__ void k_step(ec::PointA *centers, const ec::PointA *__restrict__ Gn,
     C = ec::ec_add_direct(C, special[1]);
     centers[g] = C;
 }
+#undef CGNX
+#undef CGNY
 
 } // namespace search

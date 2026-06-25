@@ -188,6 +188,7 @@ struct Config {
     uint64_t totalThreads;
     uint64_t perThreadKeys;   // i * slices
     uint64_t perLaunch;       // totalThreads * perThreadKeys
+    bool useCgn;              // Gn in constant memory (i/2 <= MAXC_GN)
 };
 
 static Config make_config(uint64_t i, uint64_t j, uint64_t slices) {
@@ -200,11 +201,12 @@ static Config make_config(uint64_t i, uint64_t j, uint64_t slices) {
     c.halfI = i / 2;
     c.K = c.halfI + 1;
     c.perThreadKeys = i * slices;
+    c.useCgn = (c.halfI <= MAXC_GN);   // Gn fits constant memory
 
     int dev; CUDA_CHECK(cudaGetDevice(&dev));
     cudaDeviceProp prop; CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
     int blocksPerSM = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSM, search::k_step<true>, (int)j, 0));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSM, search::k_step<true, true>, (int)j, 0));
     if (blocksPerSM < 1) blocksPerSM = 1;
     unsigned numBlocks = (unsigned)blocksPerSM * (unsigned)prop.multiProcessorCount;
     if (const char *e = std::getenv("CYCLONE_BLOCKS")) { int v = std::atoi(e); if (v > 0) numBlocks = (unsigned)v; }
@@ -265,17 +267,20 @@ struct SearchCtx {
             cfg.perThreadKeys, cfg.halfI);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
+        if (cfg.useCgn)   // mirror the generator table into constant memory
+            CUDA_CHECK(cudaMemcpyToSymbol(search::c_Gn, d_Gn, cfg.halfI * sizeof(ec::PointA),
+                                          0, cudaMemcpyDeviceToDevice));
     }
 
     void reset_found() { CUDA_CHECK(cudaMemset(d_res, 0, sizeof(search::FoundResult))); }
 
     void launch_step(bool genOnly = false) {
-        if (genOnly)
-            search::k_step<false><<<cfg.numBlocks, (unsigned)cfg.j>>>(d_centers, d_Gn, d_special, d_prefix,
-                (unsigned)cfg.totalThreads, (unsigned)cfg.halfI, (unsigned)cfg.slices, d_res);
-        else
-            search::k_step<true><<<cfg.numBlocks, (unsigned)cfg.j>>>(d_centers, d_Gn, d_special, d_prefix,
-                (unsigned)cfg.totalThreads, (unsigned)cfg.halfI, (unsigned)cfg.slices, d_res);
+        dim3 gd(cfg.numBlocks), bd((unsigned)cfg.j);
+#define CYC_LAUNCH(DH, UC) search::k_step<DH, UC><<<gd, bd>>>(d_centers, d_Gn, d_special, d_prefix, \
+            (unsigned)cfg.totalThreads, (unsigned)cfg.halfI, (unsigned)cfg.slices, d_res)
+        if (cfg.useCgn) { if (genOnly) CYC_LAUNCH(false, true);  else CYC_LAUNCH(true, true); }
+        else            { if (genOnly) CYC_LAUNCH(false, false); else CYC_LAUNCH(true, false); }
+#undef CYC_LAUNCH
         CUDA_CHECK(cudaGetLastError());
     }
 };
