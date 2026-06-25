@@ -3,6 +3,11 @@
 // big-endian SHA digest; RIPEMD reads little-endian words, so each SHA state word
 // is byte-swapped into the message schedule (no intermediate digest store).
 //
+// The 80 rounds of each line are FULLY UNROLLED with compile-time message-word
+// indices and rotation amounts, so the X[16] schedule stays in registers instead
+// of local memory (a large GPU win -- dynamic X[RL[j]] indexing would otherwise
+// force X to local). Constants/order are the canonical RIPEMD-160 tables.
+//
 // out[0..4] are the five RIPEMD words; the 20-byte hash160 is out[i] written
 // little-endian, so out[i] compares directly against a little-endian read of the
 // target's bytes (see search.cuh).
@@ -11,85 +16,121 @@
 
 namespace ripemd160 {
 
-// message-word selection and rotation tables (left line l*, right line r*)
-__constant__ uint8_t RL[80] = {
-    0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
-    7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,
-    3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12,
-    1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2,
-    4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13};
-__constant__ uint8_t RR[80] = {
-    5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,
-    6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,
-    15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13,
-    8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14,
-    12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11};
-__constant__ uint8_t SL[80] = {
-    11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,
-    7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,
-    11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,
-    11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,
-    9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6};
-__constant__ uint8_t SR[80] = {
-    8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,
-    9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,
-    9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,
-    15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,
-    8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11};
-
 __device__ __forceinline__ uint32_t rotl(uint32_t x, int n) {
     return (x << n) | (x >> (32 - n));
 }
-// nonlinear functions, selected by block index 0..4.
-__device__ __forceinline__ uint32_t f(int idx, uint32_t x, uint32_t y, uint32_t z) {
-    switch (idx) {
-        case 0: return x ^ y ^ z;
-        case 1: return (x & y) | (~x & z);
-        case 2: return (x | ~y) ^ z;
-        case 3: return (x & z) | (y & ~z);
-        default:return x ^ (y | ~z);
-    }
-}
-__device__ __forceinline__ uint32_t KL(int idx) {
-    const uint32_t k[5] = {0x00000000u,0x5A827999u,0x6ED9EBA1u,0x8F1BBCDCu,0xA953FD4Eu};
-    return k[idx];
-}
-__device__ __forceinline__ uint32_t KR(int idx) {
-    const uint32_t k[5] = {0x50A28BE6u,0x5C4DD124u,0x6D703EF3u,0x7A6D76E9u,0x00000000u};
-    return k[idx];
-}
+
+// nonlinear functions
+#define RMD_F(x,y,z) ((x) ^ (y) ^ (z))
+#define RMD_G(x,y,z) (((x) & (y)) | (~(x) & (z)))
+#define RMD_H(x,y,z) (((x) | ~(y)) ^ (z))
+#define RMD_I(x,y,z) (((x) & (z)) | ((y) & ~(z)))
+#define RMD_J(x,y,z) ((x) ^ ((y) | ~(z)))
+
+// left-line round macros (per-block constant embedded)
+#define LFF(a,b,c,d,e,x,s) { a += RMD_F(b,c,d) + (x);              a = rotl(a,s) + e; c = rotl(c,10); }
+#define LGG(a,b,c,d,e,x,s) { a += RMD_G(b,c,d) + (x) + 0x5a827999u; a = rotl(a,s) + e; c = rotl(c,10); }
+#define LHH(a,b,c,d,e,x,s) { a += RMD_H(b,c,d) + (x) + 0x6ed9eba1u; a = rotl(a,s) + e; c = rotl(c,10); }
+#define LII(a,b,c,d,e,x,s) { a += RMD_I(b,c,d) + (x) + 0x8f1bbcdcu; a = rotl(a,s) + e; c = rotl(c,10); }
+#define LJJ(a,b,c,d,e,x,s) { a += RMD_J(b,c,d) + (x) + 0xa953fd4eu; a = rotl(a,s) + e; c = rotl(c,10); }
+// right-line round macros (reverse functions, primed constants)
+#define RJJ(a,b,c,d,e,x,s) { a += RMD_J(b,c,d) + (x) + 0x50a28be6u; a = rotl(a,s) + e; c = rotl(c,10); }
+#define RII(a,b,c,d,e,x,s) { a += RMD_I(b,c,d) + (x) + 0x5c4dd124u; a = rotl(a,s) + e; c = rotl(c,10); }
+#define RHH(a,b,c,d,e,x,s) { a += RMD_H(b,c,d) + (x) + 0x6d703ef3u; a = rotl(a,s) + e; c = rotl(c,10); }
+#define RGG(a,b,c,d,e,x,s) { a += RMD_G(b,c,d) + (x) + 0x7a6d76e9u; a = rotl(a,s) + e; c = rotl(c,10); }
+#define RFF(a,b,c,d,e,x,s) { a += RMD_F(b,c,d) + (x);              a = rotl(a,s) + e; c = rotl(c,10); }
 
 // Fuse: X[0..7] = byteswap(SHA words); X[8]=0x80 pad; X[14]=256-bit length.
 __device__ __forceinline__ void ripemd160_from_sha(const uint32_t H[8], uint32_t out[5]) {
-    uint32_t X[16];
-#pragma unroll
-    for (int i = 0; i < 8; i++) X[i] = __byte_perm(H[i], 0, 0x0123);  // big-endian -> little
-    X[8]  = 0x00000080u;
-    X[9]  = 0; X[10] = 0; X[11] = 0; X[12] = 0; X[13] = 0;
-    X[14] = 256;          // message length in bits (low word, little-endian)
-    X[15] = 0;
+    uint32_t X0  = __byte_perm(H[0], 0, 0x0123), X1 = __byte_perm(H[1], 0, 0x0123);
+    uint32_t X2  = __byte_perm(H[2], 0, 0x0123), X3 = __byte_perm(H[3], 0, 0x0123);
+    uint32_t X4  = __byte_perm(H[4], 0, 0x0123), X5 = __byte_perm(H[5], 0, 0x0123);
+    uint32_t X6  = __byte_perm(H[6], 0, 0x0123), X7 = __byte_perm(H[7], 0, 0x0123);
+    uint32_t X8  = 0x00000080u;
+    uint32_t X9  = 0, X10 = 0, X11 = 0, X12 = 0, X13 = 0;
+    uint32_t X14 = 256u;          // message length in bits (low word, little-endian)
+    uint32_t X15 = 0;
 
     const uint32_t h0 = 0x67452301u, h1 = 0xEFCDAB89u, h2 = 0x98BADCFEu,
                    h3 = 0x10325476u, h4 = 0xC3D2E1F0u;
-    uint32_t al = h0, bl = h1, cl = h2, dl = h3, el = h4;
-    uint32_t ar = h0, br = h1, cr = h2, dr = h3, er = h4;
+    uint32_t aa = h0, bb = h1, cc = h2, dd = h3, ee = h4;
+    uint32_t aaa = h0, bbb = h1, ccc = h2, ddd = h3, eee = h4;
 
-#pragma unroll
-    for (int j = 0; j < 80; j++) {
-        int blk = j >> 4;
-        uint32_t t;
-        t  = rotl(al + f(blk, bl, cl, dl) + X[RL[j]] + KL(blk), SL[j]) + el;
-        al = el; el = dl; dl = rotl(cl, 10); cl = bl; bl = t;
+    // ---- left line ----
+    LFF(aa,bb,cc,dd,ee, X0,11) LFF(ee,aa,bb,cc,dd, X1,14) LFF(dd,ee,aa,bb,cc, X2,15) LFF(cc,dd,ee,aa,bb, X3,12)
+    LFF(bb,cc,dd,ee,aa, X4, 5) LFF(aa,bb,cc,dd,ee, X5, 8) LFF(ee,aa,bb,cc,dd, X6, 7) LFF(dd,ee,aa,bb,cc, X7, 9)
+    LFF(cc,dd,ee,aa,bb, X8,11) LFF(bb,cc,dd,ee,aa, X9,13) LFF(aa,bb,cc,dd,ee, X10,14) LFF(ee,aa,bb,cc,dd, X11,15)
+    LFF(dd,ee,aa,bb,cc, X12,6) LFF(cc,dd,ee,aa,bb, X13,7) LFF(bb,cc,dd,ee,aa, X14,9) LFF(aa,bb,cc,dd,ee, X15,8)
 
-        t  = rotl(ar + f(4 - blk, br, cr, dr) + X[RR[j]] + KR(blk), SR[j]) + er;
-        ar = er; er = dr; dr = rotl(cr, 10); cr = br; br = t;
-    }
-    uint32_t tmp = h1 + cl + dr;
-    out[1] = h2 + dl + er;
-    out[2] = h3 + el + ar;
-    out[3] = h4 + al + br;
-    out[4] = h0 + bl + cr;
-    out[0] = tmp;
+    LGG(ee,aa,bb,cc,dd, X7, 7) LGG(dd,ee,aa,bb,cc, X4, 6) LGG(cc,dd,ee,aa,bb, X13,8) LGG(bb,cc,dd,ee,aa, X1,13)
+    LGG(aa,bb,cc,dd,ee, X10,11) LGG(ee,aa,bb,cc,dd, X6, 9) LGG(dd,ee,aa,bb,cc, X15,7) LGG(cc,dd,ee,aa,bb, X3,15)
+    LGG(bb,cc,dd,ee,aa, X12,7) LGG(aa,bb,cc,dd,ee, X0,12) LGG(ee,aa,bb,cc,dd, X9,15) LGG(dd,ee,aa,bb,cc, X5, 9)
+    LGG(cc,dd,ee,aa,bb, X2,11) LGG(bb,cc,dd,ee,aa, X14,7) LGG(aa,bb,cc,dd,ee, X11,13) LGG(ee,aa,bb,cc,dd, X8,12)
+
+    LHH(dd,ee,aa,bb,cc, X3,11) LHH(cc,dd,ee,aa,bb, X10,13) LHH(bb,cc,dd,ee,aa, X14,6) LHH(aa,bb,cc,dd,ee, X4, 7)
+    LHH(ee,aa,bb,cc,dd, X9,14) LHH(dd,ee,aa,bb,cc, X15,9) LHH(cc,dd,ee,aa,bb, X8,13) LHH(bb,cc,dd,ee,aa, X1,15)
+    LHH(aa,bb,cc,dd,ee, X2,14) LHH(ee,aa,bb,cc,dd, X7, 8) LHH(dd,ee,aa,bb,cc, X0,13) LHH(cc,dd,ee,aa,bb, X6, 6)
+    LHH(bb,cc,dd,ee,aa, X13,5) LHH(aa,bb,cc,dd,ee, X11,12) LHH(ee,aa,bb,cc,dd, X5, 7) LHH(dd,ee,aa,bb,cc, X12,5)
+
+    LII(cc,dd,ee,aa,bb, X1,11) LII(bb,cc,dd,ee,aa, X9,12) LII(aa,bb,cc,dd,ee, X11,14) LII(ee,aa,bb,cc,dd, X10,15)
+    LII(dd,ee,aa,bb,cc, X0,14) LII(cc,dd,ee,aa,bb, X8,15) LII(bb,cc,dd,ee,aa, X12,9) LII(aa,bb,cc,dd,ee, X4, 8)
+    LII(ee,aa,bb,cc,dd, X13,9) LII(dd,ee,aa,bb,cc, X3,14) LII(cc,dd,ee,aa,bb, X7, 5) LII(bb,cc,dd,ee,aa, X15,6)
+    LII(aa,bb,cc,dd,ee, X14,8) LII(ee,aa,bb,cc,dd, X5, 6) LII(dd,ee,aa,bb,cc, X6, 5) LII(cc,dd,ee,aa,bb, X2,12)
+
+    LJJ(bb,cc,dd,ee,aa, X4, 9) LJJ(aa,bb,cc,dd,ee, X0,15) LJJ(ee,aa,bb,cc,dd, X5, 5) LJJ(dd,ee,aa,bb,cc, X9,11)
+    LJJ(cc,dd,ee,aa,bb, X7, 6) LJJ(bb,cc,dd,ee,aa, X12,8) LJJ(aa,bb,cc,dd,ee, X2,13) LJJ(ee,aa,bb,cc,dd, X10,12)
+    LJJ(dd,ee,aa,bb,cc, X14,5) LJJ(cc,dd,ee,aa,bb, X1,12) LJJ(bb,cc,dd,ee,aa, X3,13) LJJ(aa,bb,cc,dd,ee, X8,14)
+    LJJ(ee,aa,bb,cc,dd, X11,11) LJJ(dd,ee,aa,bb,cc, X6, 8) LJJ(cc,dd,ee,aa,bb, X15,5) LJJ(bb,cc,dd,ee,aa, X13,6)
+
+    // ---- right line ----
+    RJJ(aaa,bbb,ccc,ddd,eee, X5, 8) RJJ(eee,aaa,bbb,ccc,ddd, X14,9) RJJ(ddd,eee,aaa,bbb,ccc, X7, 9) RJJ(ccc,ddd,eee,aaa,bbb, X0,11)
+    RJJ(bbb,ccc,ddd,eee,aaa, X9,13) RJJ(aaa,bbb,ccc,ddd,eee, X2,15) RJJ(eee,aaa,bbb,ccc,ddd, X11,15) RJJ(ddd,eee,aaa,bbb,ccc, X4, 5)
+    RJJ(ccc,ddd,eee,aaa,bbb, X13,7) RJJ(bbb,ccc,ddd,eee,aaa, X6, 7) RJJ(aaa,bbb,ccc,ddd,eee, X15,8) RJJ(eee,aaa,bbb,ccc,ddd, X8,11)
+    RJJ(ddd,eee,aaa,bbb,ccc, X1,14) RJJ(ccc,ddd,eee,aaa,bbb, X10,14) RJJ(bbb,ccc,ddd,eee,aaa, X3,12) RJJ(aaa,bbb,ccc,ddd,eee, X12,6)
+
+    RII(eee,aaa,bbb,ccc,ddd, X6, 9) RII(ddd,eee,aaa,bbb,ccc, X11,13) RII(ccc,ddd,eee,aaa,bbb, X3,15) RII(bbb,ccc,ddd,eee,aaa, X7, 7)
+    RII(aaa,bbb,ccc,ddd,eee, X0,12) RII(eee,aaa,bbb,ccc,ddd, X13,8) RII(ddd,eee,aaa,bbb,ccc, X5, 9) RII(ccc,ddd,eee,aaa,bbb, X10,11)
+    RII(bbb,ccc,ddd,eee,aaa, X14,7) RII(aaa,bbb,ccc,ddd,eee, X15,7) RII(eee,aaa,bbb,ccc,ddd, X8,12) RII(ddd,eee,aaa,bbb,ccc, X12,7)
+    RII(ccc,ddd,eee,aaa,bbb, X4, 6) RII(bbb,ccc,ddd,eee,aaa, X9,15) RII(aaa,bbb,ccc,ddd,eee, X1,13) RII(eee,aaa,bbb,ccc,ddd, X2,11)
+
+    RHH(ddd,eee,aaa,bbb,ccc, X15,9) RHH(ccc,ddd,eee,aaa,bbb, X5, 7) RHH(bbb,ccc,ddd,eee,aaa, X1,15) RHH(aaa,bbb,ccc,ddd,eee, X3,11)
+    RHH(eee,aaa,bbb,ccc,ddd, X7, 8) RHH(ddd,eee,aaa,bbb,ccc, X14,6) RHH(ccc,ddd,eee,aaa,bbb, X6, 6) RHH(bbb,ccc,ddd,eee,aaa, X9,14)
+    RHH(aaa,bbb,ccc,ddd,eee, X11,12) RHH(eee,aaa,bbb,ccc,ddd, X8,13) RHH(ddd,eee,aaa,bbb,ccc, X12,5) RHH(ccc,ddd,eee,aaa,bbb, X2,14)
+    RHH(bbb,ccc,ddd,eee,aaa, X10,13) RHH(aaa,bbb,ccc,ddd,eee, X0,13) RHH(eee,aaa,bbb,ccc,ddd, X4, 7) RHH(ddd,eee,aaa,bbb,ccc, X13,5)
+
+    RGG(ccc,ddd,eee,aaa,bbb, X8,15) RGG(bbb,ccc,ddd,eee,aaa, X6, 5) RGG(aaa,bbb,ccc,ddd,eee, X4, 8) RGG(eee,aaa,bbb,ccc,ddd, X1,11)
+    RGG(ddd,eee,aaa,bbb,ccc, X3,14) RGG(ccc,ddd,eee,aaa,bbb, X11,14) RGG(bbb,ccc,ddd,eee,aaa, X15,6) RGG(aaa,bbb,ccc,ddd,eee, X0,14)
+    RGG(eee,aaa,bbb,ccc,ddd, X5, 6) RGG(ddd,eee,aaa,bbb,ccc, X12,9) RGG(ccc,ddd,eee,aaa,bbb, X2,12) RGG(bbb,ccc,ddd,eee,aaa, X13,9)
+    RGG(aaa,bbb,ccc,ddd,eee, X9,12) RGG(eee,aaa,bbb,ccc,ddd, X7, 5) RGG(ddd,eee,aaa,bbb,ccc, X10,15) RGG(ccc,ddd,eee,aaa,bbb, X14,8)
+
+    RFF(bbb,ccc,ddd,eee,aaa, X12,8) RFF(aaa,bbb,ccc,ddd,eee, X15,5) RFF(eee,aaa,bbb,ccc,ddd, X10,12) RFF(ddd,eee,aaa,bbb,ccc, X4, 9)
+    RFF(ccc,ddd,eee,aaa,bbb, X1,12) RFF(bbb,ccc,ddd,eee,aaa, X5, 5) RFF(aaa,bbb,ccc,ddd,eee, X8,14) RFF(eee,aaa,bbb,ccc,ddd, X7, 6)
+    RFF(ddd,eee,aaa,bbb,ccc, X6, 8) RFF(ccc,ddd,eee,aaa,bbb, X2,13) RFF(bbb,ccc,ddd,eee,aaa, X13,6) RFF(aaa,bbb,ccc,ddd,eee, X14,5)
+    RFF(eee,aaa,bbb,ccc,ddd, X0,15) RFF(ddd,eee,aaa,bbb,ccc, X3,13) RFF(ccc,ddd,eee,aaa,bbb, X9,11) RFF(bbb,ccc,ddd,eee,aaa, X11,11)
+
+    // combine
+    uint32_t t = h1 + cc + ddd;
+    out[1] = h2 + dd + eee;
+    out[2] = h3 + ee + aaa;
+    out[3] = h4 + aa + bbb;
+    out[4] = h0 + bb + ccc;
+    out[0] = t;
 }
+
+#undef RMD_F
+#undef RMD_G
+#undef RMD_H
+#undef RMD_I
+#undef RMD_J
+#undef LFF
+#undef LGG
+#undef LHH
+#undef LII
+#undef LJJ
+#undef RJJ
+#undef RII
+#undef RHH
+#undef RGG
+#undef RFF
 
 } // namespace ripemd160
