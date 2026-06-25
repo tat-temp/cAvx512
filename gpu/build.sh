@@ -6,7 +6,8 @@ set -euo pipefail
 ARCH="${ARCH:-sm_120}"
 OUT="${OUT:-cyclone_gpu}"
 
-echo "nvcc -O3 -arch=${ARCH} -o ${OUT} cyclone_gpu.cu"
-nvcc -O3 -arch="${ARCH}" -o "${OUT}" cyclone_gpu.cu
+# -Xptxas -v prints per-kernel register / local-memory usage (occupancy diagnostic).
+echo "nvcc -O3 -arch=${ARCH} -Xptxas -v -o ${OUT} cyclone_gpu.cu"
+nvcc -O3 -arch="${ARCH}" -Xptxas -v -o "${OUT}" cyclone_gpu.cu
 
 echo "built ./${OUT}  --  run ./${OUT} --selftest"

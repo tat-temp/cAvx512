@@ -89,6 +89,35 @@ __device__ __forceinline__ void mul256(const uint64_t a[4], const uint64_t b[4],
     }
 }
 
+// Add the 128-bit product x*y into t at limb `pos`, rippling the carry upward.
+__device__ __forceinline__ void sqr_addmul(uint64_t t[8], uint64_t x, uint64_t y, int pos) {
+    uint64_t lo = x * y, hi = __umul64hi(x, y);
+    uint64_t s = t[pos] + lo; uint64_t c = (s < lo); t[pos] = s;
+    s = t[pos + 1] + hi; uint64_t c2 = (s < hi); s += c; c2 += (s < c); t[pos + 1] = s;
+    for (int k = pos + 2; k < 8 && c2; k++) { uint64_t s2 = t[k] + c2; c2 = (s2 < t[k]); t[k] = s2; }
+}
+
+// 256-bit squaring -> 512: sum the upper-triangle cross products once, double, then
+// add the diagonal squares. 10 multiplies instead of mul256's 16. The full square
+// is < 2^512, and only additions accumulate, so t[7] never overflows.
+__device__ __forceinline__ void sqr256(const uint64_t a[4], uint64_t t[8]) {
+#pragma unroll
+    for (int k = 0; k < 8; k++) t[k] = 0;
+    sqr_addmul(t, a[0], a[1], 1);
+    sqr_addmul(t, a[0], a[2], 2);
+    sqr_addmul(t, a[0], a[3], 3);
+    sqr_addmul(t, a[1], a[2], 3);
+    sqr_addmul(t, a[1], a[3], 4);
+    sqr_addmul(t, a[2], a[3], 5);
+    uint64_t carry = 0;                     // double the cross-product sum
+#pragma unroll
+    for (int k = 0; k < 8; k++) { uint64_t nc = t[k] >> 63; t[k] = (t[k] << 1) | carry; carry = nc; }
+    sqr_addmul(t, a[0], a[0], 0);           // + diagonal squares
+    sqr_addmul(t, a[1], a[1], 2);
+    sqr_addmul(t, a[2], a[2], 4);
+    sqr_addmul(t, a[3], a[3], 6);
+}
+
 // value (carry:r) is < 2p; subtract p once (branchless) to land in [0, p).
 __device__ __forceinline__ void csub_p(uint64_t r[4], uint64_t hicarry) {
     const uint64_t Pl[4] = {FE_P0, FE_P1, FE_P2, FE_P3};
@@ -174,9 +203,11 @@ __device__ __forceinline__ Elem fe_mul(const Elem &a, const Elem &b) {
 }
 
 __device__ __forceinline__ Elem fe_sqr(const Elem &a) {
-    // Dedicated squaring is a known ~30% win; left as mul(a,a) for the correct
-    // baseline (one code path to validate). Optimization lever, not correctness.
-    return fe_mul(a, a);
+    uint64_t t[8];
+    sqr256(a.v, t);
+    Elem r;
+    reduce(t, r.v);
+    return r;
 }
 
 __device__ __forceinline__ Elem fe_sqrn(Elem a, int n) {
@@ -187,7 +218,10 @@ __device__ __forceinline__ Elem fe_sqrn(Elem a, int n) {
 
 // Modular inverse: a^(p-2) mod p via the libsecp256k1 addition chain.
 // (p-2) is 5 runs of 1-bits with block lengths drawn from {1, 2, 22, 223}.
-__device__ __forceinline__ Elem fe_inv(const Elem &a) {
+// Deliberately NOT force-inlined: it is large (~255 squarings) and called once per
+// batch, so keeping it out of line frees a lot of registers in k_step (raising
+// occupancy) at negligible call-overhead cost.
+__device__ __noinline__ Elem fe_inv(const Elem &a) {
     Elem x2, x3, x6, x9, x11, x22, x44, x88, x176, x220, x223, t;
 
     x2 = fe_mul(fe_sqr(a), a);                 // a^(2^2-1)
