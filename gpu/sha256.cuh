@@ -22,20 +22,11 @@ __device__ __forceinline__ uint32_t rotr(uint32_t x, int n) {
     return (x >> n) | (x << (32 - n));
 }
 
-// msg = 33 bytes. Produces the 8 digest words (big-endian integers).
-__device__ __forceinline__ void sha256_33(const uint8_t msg[33], uint32_t H[8]) {
-    uint32_t w[16];
-#pragma unroll
-    for (int i = 0; i < 8; i++)
-        w[i] = ((uint32_t)msg[4*i]   << 24) | ((uint32_t)msg[4*i+1] << 16) |
-               ((uint32_t)msg[4*i+2] << 8)  |  (uint32_t)msg[4*i+3];
-    w[8]  = ((uint32_t)msg[32] << 24) | (0x80u << 16);  // byte 32 = x[31], byte 33 = 0x80
-    w[9]  = 0; w[10] = 0; w[11] = 0; w[12] = 0; w[13] = 0; w[14] = 0;
-    w[15] = 264;                                          // message length in bits
-
+// SHA-256 compression over the 16 initial schedule words (rolling window; w is
+// overwritten). Produces the 8 digest words (big-endian integers).
+__device__ __forceinline__ void compress16(uint32_t w[16], uint32_t H[8]) {
     uint32_t a = 0x6a09e667, b = 0xbb67ae85, c = 0x3c6ef372, d = 0xa54ff53a;
     uint32_t e = 0x510e527f, f = 0x9b05688c, g = 0x1f83d9ab, h = 0x5be0cd19;
-
 #pragma unroll
     for (int i = 0; i < 64; i++) {
         uint32_t wi;
@@ -58,6 +49,39 @@ __device__ __forceinline__ void sha256_33(const uint8_t msg[33], uint32_t H[8]) 
     }
     H[0] = a + 0x6a09e667; H[1] = b + 0xbb67ae85; H[2] = c + 0x3c6ef372; H[3] = d + 0xa54ff53a;
     H[4] = e + 0x510e527f; H[5] = f + 0x9b05688c; H[6] = g + 0x1f83d9ab; H[7] = h + 0x5be0cd19;
+}
+
+// msg = 33 bytes. Produces the 8 digest words.
+__device__ __forceinline__ void sha256_33(const uint8_t msg[33], uint32_t H[8]) {
+    uint32_t w[16];
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+        w[i] = ((uint32_t)msg[4*i]   << 24) | ((uint32_t)msg[4*i+1] << 16) |
+               ((uint32_t)msg[4*i+2] << 8)  |  (uint32_t)msg[4*i+3];
+    w[8]  = ((uint32_t)msg[32] << 24) | (0x80u << 16);
+    w[9]  = 0; w[10] = 0; w[11] = 0; w[12] = 0; w[13] = 0; w[14] = 0;
+    w[15] = 264;
+    compress16(w, H);
+}
+
+// Build the 16 SHA words straight from x's 4 limbs + the parity bit, for the
+// compressed key (0x02|parity) || BE(x) -- no 33-byte array round-trip. wp[] are the
+// big-endian 32-bit halves of x (high then low of v3..v0; the aligned message words);
+// the 1-byte 0x02/0x03 prefix shifts every word right by one byte.
+__device__ __forceinline__ void sha256_x(const uint64_t x[4], unsigned parity, uint32_t H[8]) {
+    uint32_t wp[8];
+    wp[0] = (uint32_t)(x[3] >> 32); wp[1] = (uint32_t)x[3];
+    wp[2] = (uint32_t)(x[2] >> 32); wp[3] = (uint32_t)x[2];
+    wp[4] = (uint32_t)(x[1] >> 32); wp[5] = (uint32_t)x[1];
+    wp[6] = (uint32_t)(x[0] >> 32); wp[7] = (uint32_t)x[0];
+    uint32_t w[16];
+    w[0] = ((0x02u | (parity & 1u)) << 24) | (wp[0] >> 8);
+#pragma unroll
+    for (int i = 1; i < 8; i++) w[i] = (wp[i-1] << 24) | (wp[i] >> 8);
+    w[8]  = (wp[7] << 24) | 0x00800000u;     // last x byte, then 0x80
+    w[9]  = 0; w[10] = 0; w[11] = 0; w[12] = 0; w[13] = 0; w[14] = 0;
+    w[15] = 264;
+    compress16(w, H);
 }
 
 } // namespace sha256

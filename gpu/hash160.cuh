@@ -14,12 +14,11 @@ __device__ __forceinline__ void compressed(const ec::PointA &P, uint8_t out[33])
     fe::fe_to_bytes_be(P.x, &out[1]);
 }
 
-// hash160 of an affine pubkey -> out[0..4] (little-endian words).
+// hash160 of an affine pubkey -> out[0..4] (little-endian words). Feeds x's limbs
+// straight into SHA (sha256_x), skipping the 33-byte compressed-key array.
 __device__ __forceinline__ void hash160_point(const ec::PointA &P, uint32_t out[5]) {
-    uint8_t msg[33];
-    compressed(P, msg);
     uint32_t H[8];
-    sha256::sha256_33(msg, H);
+    sha256::sha256_x(P.x.v, fe::fe_is_odd(P.y), H);
     ripemd160::ripemd160_from_sha(H, out);
 }
 
