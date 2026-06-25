@@ -67,34 +67,40 @@ __device__ __forceinline__ uint64_t sub4(const uint64_t a[4], const uint64_t b[4
     return borrow;
 }
 
-// 256x256 -> 512 schoolbook (operand scanning). The running (carry:limb) total at
-// each step is <= 2^128-1, so the high word never overflows.
+// 256x256 -> 512 schoolbook (operand scanning) via unsigned __int128, so nvcc
+// emits native mad.lo/hi.cc + addc carry chains. The running (a*b + limb + carry)
+// total is <= 2^128-1, so the high word never overflows.
 __device__ __forceinline__ void mul256(const uint64_t a[4], const uint64_t b[4],
                                         uint64_t r[8]) {
 #pragma unroll
     for (int k = 0; k < 8; k++) r[k] = 0;
 #pragma unroll
     for (int i = 0; i < 4; i++) {
-        uint64_t carry = 0;
+        unsigned __int128 carry = 0;
 #pragma unroll
         for (int j = 0; j < 4; j++) {
-            uint64_t lo, hi;
-            mul64(a[i], b[j], lo, hi);
-            uint64_t s = r[i + j] + lo; hi += (s < lo);
-            s += carry;                 hi += (s < carry);
-            r[i + j] = s;
-            carry = hi;
+            unsigned __int128 cur = (unsigned __int128)a[i] * b[j]
+                                  + (unsigned __int128)r[i + j] + carry;
+            r[i + j] = (uint64_t)cur;
+            carry = cur >> 64;
         }
-        r[i + 4] += carry;
+        r[i + 4] = (uint64_t)carry;
     }
 }
 
 // Add the 128-bit product x*y into t at limb `pos`, rippling the carry upward.
 __device__ __forceinline__ void sqr_addmul(uint64_t t[8], uint64_t x, uint64_t y, int pos) {
-    uint64_t lo = x * y, hi = __umul64hi(x, y);
-    uint64_t s = t[pos] + lo; uint64_t c = (s < lo); t[pos] = s;
-    s = t[pos + 1] + hi; uint64_t c2 = (s < hi); s += c; c2 += (s < c); t[pos + 1] = s;
-    for (int k = pos + 2; k < 8 && c2; k++) { uint64_t s2 = t[k] + c2; c2 = (s2 < t[k]); t[k] = s2; }
+    unsigned __int128 prod = (unsigned __int128)x * y;
+    unsigned __int128 cur = (unsigned __int128)t[pos] + (uint64_t)prod;
+    t[pos] = (uint64_t)cur;
+    cur = (unsigned __int128)t[pos + 1] + (uint64_t)(prod >> 64) + (uint64_t)(cur >> 64);
+    t[pos + 1] = (uint64_t)cur;
+    uint64_t carry = (uint64_t)(cur >> 64);
+    for (int k = pos + 2; k < 8 && carry; k++) {
+        unsigned __int128 s = (unsigned __int128)t[k] + carry;
+        t[k] = (uint64_t)s;
+        carry = (uint64_t)(s >> 64);
+    }
 }
 
 // 256-bit squaring -> 512: sum the upper-triangle cross products once, double, then
@@ -136,37 +142,32 @@ __device__ __forceinline__ void reduce(const uint64_t t[8], uint64_t r[4]) {
     // fold1: m = t[hi] * C  (4-limb x 64-bit -> 5 limbs), then s = t[lo] + m.
     uint64_t m[5];
     {
-        uint64_t carry = 0;
+        unsigned __int128 carry = 0;
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-            uint64_t lo, hi;
-            mul64(t[4 + k], FE_C, lo, hi);
-            lo += carry; hi += (lo < carry);
-            m[k] = lo; carry = hi;
+            unsigned __int128 cur = (unsigned __int128)t[4 + k] * FE_C + carry;
+            m[k] = (uint64_t)cur; carry = cur >> 64;
         }
-        m[4] = carry;
+        m[4] = (uint64_t)carry;       // < 2^34
     }
     uint64_t s[5];
     {
-        uint64_t carry = 0;
+        unsigned __int128 carry = 0;
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-            uint64_t x = t[k] + m[k]; uint64_t c = (x < t[k]);
-            x += carry;               c += (x < carry);
-            s[k] = x; carry = c;
+            unsigned __int128 cur = (unsigned __int128)t[k] + m[k] + carry;
+            s[k] = (uint64_t)cur; carry = cur >> 64;
         }
-        s[4] = m[4] + carry;          // < 2^34
+        s[4] = m[4] + (uint64_t)carry; // < 2^34
     }
     // fold2: r = s[lo] + s[4]*C   (s[4]*C < 2^67)
-    uint64_t lo, hi;
-    mul64(s[4], FE_C, lo, hi);        // hi < 8
-    uint64_t carry, x, c;
-    x = s[0] + lo;     carry = (x < lo);              r[0] = x;
-    x = s[1] + hi;     c = (x < hi);
-    x = x + carry;     c += (x < carry);              r[1] = x; carry = c;
-    x = s[2] + carry;  carry = (x < carry);           r[2] = x;
-    x = s[3] + carry;  carry = (x < carry);           r[3] = x;
-    csub_p(r, carry);                 // value (carry:r) < 2p
+    unsigned __int128 sc = (unsigned __int128)s[4] * FE_C;   // < 2^67
+    uint64_t lo = (uint64_t)sc, hi = (uint64_t)(sc >> 64);   // hi < 8
+    unsigned __int128 cur = (unsigned __int128)s[0] + lo;            r[0] = (uint64_t)cur;
+    cur = (unsigned __int128)s[1] + hi + (uint64_t)(cur >> 64);      r[1] = (uint64_t)cur;
+    cur = (unsigned __int128)s[2] + (uint64_t)(cur >> 64);           r[2] = (uint64_t)cur;
+    cur = (unsigned __int128)s[3] + (uint64_t)(cur >> 64);           r[3] = (uint64_t)cur;
+    csub_p(r, (uint64_t)(cur >> 64));                 // value (carry:r) < 2p
 }
 
 // --- field ops --------------------------------------------------------------
