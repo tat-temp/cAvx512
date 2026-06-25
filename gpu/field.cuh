@@ -88,40 +88,41 @@ __device__ __forceinline__ void mul256(const uint64_t a[4], const uint64_t b[4],
     }
 }
 
-// Add the 128-bit product x*y into t at limb `pos`, rippling the carry upward.
-__device__ __forceinline__ void sqr_addmul(uint64_t t[8], uint64_t x, uint64_t y, int pos) {
-    unsigned __int128 prod = (unsigned __int128)x * y;
-    unsigned __int128 cur = (unsigned __int128)t[pos] + (uint64_t)prod;
-    t[pos] = (uint64_t)cur;
-    cur = (unsigned __int128)t[pos + 1] + (uint64_t)(prod >> 64) + (uint64_t)(cur >> 64);
-    t[pos + 1] = (uint64_t)cur;
-    uint64_t carry = (uint64_t)(cur >> 64);
-    for (int k = pos + 2; k < 8 && carry; k++) {
-        unsigned __int128 s = (unsigned __int128)t[k] + carry;
-        t[k] = (uint64_t)s;
-        carry = (uint64_t)(s >> 64);
-    }
-}
-
-// 256-bit squaring -> 512: sum the upper-triangle cross products once, double, then
-// add the diagonal squares. 10 multiplies instead of mul256's 16. The full square
-// is < 2^512, and only additions accumulate, so t[7] never overflows.
+// 256-bit squaring -> 512, BRANCHLESS (no data-dependent carry ripple, so no warp
+// divergence). Upper-triangle cross products via operand scanning -- carries flow
+// in the fixed, fully-unrolled inner loops -- then double, then add the diagonal
+// squares with a single fixed carry sweep (each diagonal occupies limbs 2i,2i+1, so
+// one carry threads straight into the next). 10 multiplies, same as the prior
+// triangle form, but with zero data-dependent control flow. Square is < 2^512 and
+// only additions accumulate, so the top limb never overflows.
 __device__ __forceinline__ void sqr256(const uint64_t a[4], uint64_t t[8]) {
+    uint64_t cr[8];
 #pragma unroll
-    for (int k = 0; k < 8; k++) t[k] = 0;
-    sqr_addmul(t, a[0], a[1], 1);
-    sqr_addmul(t, a[0], a[2], 2);
-    sqr_addmul(t, a[0], a[3], 3);
-    sqr_addmul(t, a[1], a[2], 3);
-    sqr_addmul(t, a[1], a[3], 4);
-    sqr_addmul(t, a[2], a[3], 5);
-    uint64_t carry = 0;                     // double the cross-product sum
+    for (int k = 0; k < 8; k++) cr[k] = 0;
 #pragma unroll
-    for (int k = 0; k < 8; k++) { uint64_t nc = t[k] >> 63; t[k] = (t[k] << 1) | carry; carry = nc; }
-    sqr_addmul(t, a[0], a[0], 0);           // + diagonal squares
-    sqr_addmul(t, a[1], a[1], 2);
-    sqr_addmul(t, a[2], a[2], 4);
-    sqr_addmul(t, a[3], a[3], 6);
+    for (int i = 0; i < 4; i++) {
+        unsigned __int128 carry = 0;
+#pragma unroll
+        for (int j = i + 1; j < 4; j++) {
+            unsigned __int128 cur = (unsigned __int128)a[i] * a[j] + cr[i + j] + carry;
+            cr[i + j] = (uint64_t)cur;
+            carry = cur >> 64;
+        }
+        cr[i + 4] = (uint64_t)carry;
+    }
+    uint64_t hi = 0;                        // t = 2 * cr
+#pragma unroll
+    for (int k = 0; k < 8; k++) { uint64_t nc = cr[k] >> 63; t[k] = (cr[k] << 1) | hi; hi = nc; }
+    uint64_t carry = 0;                     // + diagonal squares a_i^2 at limb 2i
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        unsigned __int128 sq = (unsigned __int128)a[i] * a[i];
+        unsigned __int128 cur = (unsigned __int128)t[2 * i] + (uint64_t)sq + carry;
+        t[2 * i] = (uint64_t)cur;
+        cur = (unsigned __int128)t[2 * i + 1] + (uint64_t)(sq >> 64) + (uint64_t)(cur >> 64);
+        t[2 * i + 1] = (uint64_t)cur;
+        carry = (uint64_t)(cur >> 64);
+    }
 }
 
 // value (carry:r) is < 2p; subtract p once (branchless) to land in [0, p).
