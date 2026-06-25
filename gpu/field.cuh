@@ -141,15 +141,29 @@ __device__ __forceinline__ void csub_p(uint64_t r[4], uint64_t hicarry) {
 // 512 -> 256 mod p via the secp256k1 two-pass fold.
 __device__ __forceinline__ void reduce(const uint64_t t[8], uint64_t r[4]) {
     // fold1: m = t[hi] * C  (4-limb x 64-bit -> 5 limbs), then s = t[lo] + m.
+    // Strength-reduce the constant multiply: C = 2^32 + 977, so
+    //   m = t_hi*C = (t_hi << 32) + t_hi*977   (shift is free; 977 is 10-bit).
     uint64_t m[5];
     {
+        uint64_t p[5];                // t_hi * 977
         unsigned __int128 carry = 0;
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-            unsigned __int128 cur = (unsigned __int128)t[4 + k] * FE_C + carry;
-            m[k] = (uint64_t)cur; carry = cur >> 64;
+            unsigned __int128 cur = (unsigned __int128)t[4 + k] * 977u + carry;
+            p[k] = (uint64_t)cur; carry = cur >> 64;
         }
-        m[4] = (uint64_t)carry;       // < 2^34
+        p[4] = (uint64_t)carry;       // < 2^10
+        uint64_t s0 =  t[4] << 32;                       // t_hi << 32 (5 limbs)
+        uint64_t s1 = (t[5] << 32) | (t[4] >> 32);
+        uint64_t s2 = (t[6] << 32) | (t[5] >> 32);
+        uint64_t s3 = (t[7] << 32) | (t[6] >> 32);
+        uint64_t s4 =  t[7] >> 32;
+        unsigned __int128 c = 0;                          // m = p + (t_hi << 32)
+        c += (unsigned __int128)p[0] + s0; m[0] = (uint64_t)c; c >>= 64;
+        c += (unsigned __int128)p[1] + s1; m[1] = (uint64_t)c; c >>= 64;
+        c += (unsigned __int128)p[2] + s2; m[2] = (uint64_t)c; c >>= 64;
+        c += (unsigned __int128)p[3] + s3; m[3] = (uint64_t)c; c >>= 64;
+        m[4] = p[4] + s4 + (uint64_t)c;   // < 2^33
     }
     uint64_t s[5];
     {
