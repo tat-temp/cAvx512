@@ -819,6 +819,71 @@ static const ifma::FieldVec8 *ifma_batchInvertSoA_sub(
     return ivcol;
 }
 
+// G-way parallel Montgomery batch inversion (experimental; A/B harness only).
+// Same per-lane result as ifma_batchInvertSoA_sub, but the single serial
+// prefix-product recurrence -- the latency-bound spine of the inversion -- is
+// split into G independent chains, interleaved by column, so the out-of-order
+// core can overlap their IFMA muls instead of stalling on one dependency chain.
+// The G segment totals are reconciled through ONE shared Fermat inverse (inv8),
+// adding only ~2(G-1) muls. Templated on G so the inner G-loop unrolls; falls
+// back to the single-chain path when numBulk < G.
+template<int G>
+static const ifma::FieldVec8 *ifma_batchInvertSoA_sub_split(
+        const ifma::FieldVec8 *GXcol, const ifma::FieldVec8 &SPX,
+        Int *a, int numBulk, int n) {
+    if (G < 2 || numBulk < G)
+        return ifma_batchInvertSoA_sub(GXcol, SPX, a, numBulk, n);
+
+    static thread_local ifma::FieldVec8 P[CPU_GROUP_SIZE / 16 + 1];
+    static thread_local ifma::FieldVec8 ivcol[CPU_GROUP_SIZE / 16 + 1];
+
+    // Near-equal contiguous partition: segment g spans columns [lo[g], hi[g]).
+    int lo[G], hi[G];
+    const int seg = numBulk / G, rem = numBulk % G;
+    for (int g = 0, off = 0; g < G; g++) {
+        lo[g] = off; off += seg + (g < rem ? 1 : 0); hi[g] = off;
+    }
+    const int maxlen = seg + (rem ? 1 : 0);                 // longest segment length
+
+    auto Dof = [&](int k) {                                 // diff GXcol[k]-SPX, normalized
+        ifma::FieldVec8 d = ifma::sub(GXcol[k], SPX); ifma::normalize_weak(d); return d;
+    };
+
+    // Forward: G independent inclusive prefix-product chains, interleaved so the
+    // four (independent) muls of one i-step issue together and hide each other's latency.
+    for (int g = 0; g < G; g++) P[lo[g]] = Dof(lo[g]);
+    for (int i = 1; i < maxlen; i++)
+        for (int g = 0; g < G; g++) {
+            const int k = lo[g] + i;
+            if (k < hi[g]) P[k] = ifma::mul(P[k - 1], Dof(k));
+        }
+
+    // Reconcile the G segment totals T[g] through a single shared inverse.
+    ifma::FieldVec8 T[G], Q[G], Tinv[G];
+    for (int g = 0; g < G; g++) T[g] = P[hi[g] - 1];
+    Q[0] = T[0];
+    for (int g = 1; g < G; g++) Q[g] = ifma::mul(Q[g - 1], T[g]);   // prefix of totals
+    ifma::FieldVec8 ginv = ifma::inv8(Q[G - 1]);                    // 1 / prod(all diffs)
+    for (int g = G - 1; g > 0; g--) {
+        Tinv[g] = ifma::mul(Q[g - 1], ginv);                       // 1 / total(segment g)
+        ginv    = ifma::mul(ginv, T[g]);
+    }
+    Tinv[0] = ginv;
+
+    // Backward: G independent substitution chains, interleaved, each seeded by 1/total(g).
+    ifma::FieldVec8 inv[G];
+    for (int g = 0; g < G; g++) inv[g] = Tinv[g];
+    for (int i = 0; i < maxlen; i++)
+        for (int g = 0; g < G; g++) {
+            const int k = hi[g] - 1 - i;
+            if (k > lo[g]) { ivcol[k] = ifma::mul(P[k - 1], inv[g]); inv[g] = ifma::mul(inv[g], Dof(k)); }
+            else if (k == lo[g]) ivcol[lo[g]] = inv[g];
+        }
+
+    for (int i = numBulk * 8; i < n; i++) a[i].ModInv();    // scalar tail (gen8-uncovered)
+    return ivcol;
+}
+
 // IFMA group generator: fill pts[0..CPU_GROUP_SIZE-1] with pubkeys for the keys
 // [base, base+CPU_GROUP_SIZE) (startP on entry = pubkey of base+CENTER), using
 // gen8 (8 plus + 8 minus per batch) for the bulk and scalar for the tail. dx is
@@ -899,12 +964,19 @@ static void getGnSoA(Point *Gn, int numBulk,
     *gyOut = GYcol;
 }
 
+// Batch-inversion function signature: lets the group generator be parameterized
+// over the inversion (single-chain vs split-chain) for same-binary A/B.
+using IfmaInvFn = const ifma::FieldVec8 *(*)(const ifma::FieldVec8 *,
+                                             const ifma::FieldVec8 &, Int *, int, int);
+
 // Like genGroupIFMA, but writes each public key directly as a 33-byte compressed
 // SHA block (via to_compressed8 for the 8-lane bulk, storeCompScalar for the
 // tail) into the caller's pre-formatted CPU_GROUP_SIZE x 64 buffer -- no Point
 // round-trip, no GetBytes() in the hash phase. Index mapping matches genGroupIFMA
-// exactly. startP is advanced by CPU_GROUP_SIZE*G on return.
-static void genGroupIFMABlocks(Point &startP, Point *Gn, Point &_2Gn,
+// exactly. startP is advanced by CPU_GROUP_SIZE*G on return. Parameterized over
+// the batch inversion (Inv); the production wrapper below pins the single-chain one.
+template<IfmaInvFn Inv>
+static void genGroupIFMABlocks_impl(Point &startP, Point *Gn, Point &_2Gn,
                                std::vector<Int> &dx, IntGroup &grp, uint8_t *blocks) {
     const int CENTER  = CPU_GROUP_SIZE / 2;
     const int hLength = CENTER - 1;
@@ -922,7 +994,7 @@ static void genGroupIFMABlocks(Point &startP, Point *Gn, Point &_2Gn,
     ifma::FieldVec8 SPX = ifma::broadcast(startP.x);
     ifma::FieldVec8 SPY = ifma::broadcast(startP.y);
     const ifma::FieldVec8 *ivcol =             // bulk diffs = GXcol-SPX, inverted in SoA; tail in dx[]
-        ifma_batchInvertSoA_sub(GXcol, SPX, dx.data(), numBulk, CENTER + 1);
+        Inv(GXcol, SPX, dx.data(), numBulk, CENTER + 1);
 
     storeCompScalar(startP, blocks + (long)CENTER * 64);
 
@@ -962,6 +1034,12 @@ static void genGroupIFMABlocks(Point &startP, Point *Gn, Point &_2Gn,
     pp.x.ModNeg(); pp.x.ModAdd(&p2); pp.x.ModSub(&_2Gn.x);
     pp.y.ModSub(&_2Gn.x, &pp.x); pp.y.ModMulK1(&s); pp.y.ModSub(&_2Gn.y);
     startP = pp;
+}
+
+// Production block-path group generator: the validated single-chain batch inversion.
+static void genGroupIFMABlocks(Point &startP, Point *Gn, Point &_2Gn,
+                               std::vector<Int> &dx, IntGroup &grp, uint8_t *blocks) {
+    genGroupIFMABlocks_impl<ifma_batchInvertSoA_sub>(startP, Gn, _2Gn, dx, grp, blocks);
 }
 
 // Production IFMA search path: generate the whole 4096-point group straight into
@@ -1244,6 +1322,39 @@ static int runSelfTestIFMA() {
         }
     }
 
+    // Split-chain batch inversion (A/B variants) must produce byte-identical blocks
+    // and the same startP advance as the production single-chain path, across reused
+    // multi-group buffers. fSplit = block mismatches + advance drift over G=2 and G=4.
+    int fSplit = 0;
+    {
+        const int NGROUPS = 4;
+        std::vector<Point> Gn(CPU_GROUP_SIZE / 2); Point _2Gn;
+        buildGeneratorTable(secp, Gn.data(), _2Gn);
+        Int base; for (int i = 0; i < NB64BLOCK; i++) base.bits64[i] = 0;
+        base.bits64[0] = 0x100000ULL;
+        Int half; half.SetInt32(CPU_GROUP_SIZE / 2);
+        Int center; center.Set(&base); center.Add(&half);
+        Point sp0 = secp.ComputePublicKey(&center);
+
+        Point spR = sp0, sp2 = sp0, sp4 = sp0;
+        std::vector<Int> dxR(CPU_GROUP_SIZE/2+1), dx2(CPU_GROUP_SIZE/2+1), dx4(CPU_GROUP_SIZE/2+1);
+        IntGroup gR(CPU_GROUP_SIZE/2+1); gR.Set(dxR.data());
+        IntGroup g2(CPU_GROUP_SIZE/2+1); g2.Set(dx2.data());
+        IntGroup g4(CPU_GROUP_SIZE/2+1); g4.Set(dx4.data());
+        std::vector<uint8_t> bR((size_t)CPU_GROUP_SIZE*64), b2((size_t)CPU_GROUP_SIZE*64), b4((size_t)CPU_GROUP_SIZE*64);
+        initBlocks(bR.data()); initBlocks(b2.data()); initBlocks(b4.data());
+
+        for (int g = 0; g < NGROUPS; g++) {
+            genGroupIFMABlocks_impl<ifma_batchInvertSoA_sub>          (spR, Gn.data(), _2Gn, dxR, gR, bR.data());
+            genGroupIFMABlocks_impl<ifma_batchInvertSoA_sub_split<2>> (sp2, Gn.data(), _2Gn, dx2, g2, b2.data());
+            genGroupIFMABlocks_impl<ifma_batchInvertSoA_sub_split<4>> (sp4, Gn.data(), _2Gn, dx4, g4, b4.data());
+            if (std::memcmp(bR.data(), b2.data(), (size_t)CPU_GROUP_SIZE*64) != 0) fSplit++;
+            if (std::memcmp(bR.data(), b4.data(), (size_t)CPU_GROUP_SIZE*64) != 0) fSplit++;
+            if (!spR.x.IsEqual(&sp2.x) || !spR.y.IsEqual(&sp2.y)) fSplit++;
+            if (!spR.x.IsEqual(&sp4.x) || !spR.y.IsEqual(&sp4.y)) fSplit++;
+        }
+    }
+
     auto line = [](const char *name, int fails) {
         std::cout << name << " : " << (fails == 0 ? "OK" : "FAIL");
         if (fails) std::cout << " (" << fails << " mismatches)";
@@ -1266,9 +1377,10 @@ static int runSelfTestIFMA() {
     line("to_compressed8       ", fComp);
     line("block path vs point  ", fBlocks);
     line("block advance drift  ", fAdv);
+    line("split inversion A/B  ", fSplit);
 
     int failures = fRound + fSoA + fAdd + fSub + fNeg + fNorm + fMul + fSqr + fInv + fBatch
-                 + fGenP + fGenM + fCompGen + fGroup + fComp + fBlocks + fAdv;
+                 + fGenP + fGenM + fCompGen + fGroup + fComp + fBlocks + fAdv + fSplit;
     std::cout << "================================================\n";
     std::cout << (failures == 0 ? "IFMA FIELD SELFTEST PASSED\n" : "IFMA FIELD SELFTEST FAILED\n");
     return failures == 0 ? 0 : 1;
@@ -1529,6 +1641,81 @@ static void runBenchOverlap(Secp256K1 &secp, long long iters, int threads) {
 }
 
 //------------------------------------------------------------------------------
+// Gen-blocks A/B -- batch-inversion ILP. Times the block-path point generation
+// with the production single-chain batch inversion vs the G-way split-chain
+// variants, in ONE binary over identical work. The split breaks the serial
+// prefix-product recurrence into G independent interleaved chains (reconciled
+// through a single inv8) to hide IFMA latency; this reports whether that ILP
+// actually beats the latency-bound baseline on this CPU, separately at 1T and
+// all-core (the answer can differ -- SMT may already hide the latency across
+// sibling threads). All variants emit byte-identical blocks (gated by
+// --selftest-ifma), so any rate delta is pure inversion ILP, no layout confound.
+//------------------------------------------------------------------------------
+static void runBenchGenBlocksAB(Secp256K1 &secp, long long batchesPerThread, int threads) {
+    if (threads <= 0) threads = omp_get_num_procs();
+
+    std::vector<Point> Gn(CPU_GROUP_SIZE / 2);
+    Point _2Gn;
+    buildGeneratorTable(secp, Gn.data(), _2Gn);
+
+    unsigned long long sinkTotal = 0;
+
+    // variant: 1 = single-chain (production), 2 = split G=2, 4 = split G=4.
+    auto runPath = [&](int variant) -> double {
+        unsigned long long sink = 0;
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        #pragma omp parallel num_threads(threads) reduction(+:sink)
+        {
+            const int tid = omp_get_thread_num();
+            Int priv;   priv.SetInt32((uint32_t)(tid + 1) * 1000003u);
+            Int half;   half.SetInt32(CPU_GROUP_SIZE / 2);
+            Int center; center.Set(&priv); center.Add(&half);
+            Point startP = secp.ComputePublicKey(&center);
+
+            std::vector<Int> dx(CPU_GROUP_SIZE / 2 + 1);
+            IntGroup grp(CPU_GROUP_SIZE / 2 + 1); grp.Set(dx.data());
+            std::vector<uint8_t> blocks((size_t)CPU_GROUP_SIZE * 64);
+            initBlocks(blocks.data());
+
+            for (long long b = 0; b < batchesPerThread; ++b) {
+                if (variant == 2)
+                    genGroupIFMABlocks_impl<ifma_batchInvertSoA_sub_split<2>>(startP, Gn.data(), _2Gn, dx, grp, blocks.data());
+                else if (variant == 4)
+                    genGroupIFMABlocks_impl<ifma_batchInvertSoA_sub_split<4>>(startP, Gn.data(), _2Gn, dx, grp, blocks.data());
+                else
+                    genGroupIFMABlocks_impl<ifma_batchInvertSoA_sub>(startP, Gn.data(), _2Gn, dx, grp, blocks.data());
+                uint64_t acc = 0;          // read spread-out blocks so gen can't be elided
+                for (int q = 0; q < CPU_GROUP_SIZE; q += 256) acc ^= blocks[(size_t)q * 64];
+                sink += acc;
+            }
+        }
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        sinkTotal += sink;
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        const unsigned long long totalKeys =
+            (unsigned long long)threads * (unsigned long long)batchesPerThread * CPU_GROUP_SIZE;
+        return secs > 0.0 ? (totalKeys / secs / 1e6) : 0.0;
+    };
+
+    (void)runPath(1); (void)runPath(2); (void)runPath(4);   // warm all three paths
+    const double r1 = runPath(1);
+    const double r2 = runPath(2);
+    const double r4 = runPath(4);
+
+    std::cout << "=========== GEN-BLOCKS A/B (inversion ILP) ===========\n";
+    std::cout << "Threads             : " << threads << "\n";
+    std::cout << "Batches/thread      : " << batchesPerThread
+              << "  (group size " << CPU_GROUP_SIZE << ")\n";
+    std::cout << "single-chain (prod) : " << std::fixed << std::setprecision(2) << r1 << " Mkeys/s\n";
+    std::cout << "split G=2           : " << std::fixed << std::setprecision(2) << r2
+              << " Mkeys/s  (" << std::setprecision(3) << (r1 > 0.0 ? r2 / r1 : 0.0) << "x)\n";
+    std::cout << "split G=4           : " << std::fixed << std::setprecision(2) << r4
+              << " Mkeys/s  (" << std::setprecision(3) << (r1 > 0.0 ? r4 / r1 : 0.0) << "x)\n";
+    std::cout << "(checksum sink      : " << sinkTotal << ")\n";
+    std::cout << "======================================================\n";
+}
+
+//------------------------------------------------------------------------------
 // 0.1 Benchmark mode: run a fixed number of batches/thread with no I/O and no
 // early exit, then report throughput. Run several times and take the median; use
 // the optional thread argument (e.g. "--bench 2000 1") for the single-thread
@@ -1677,6 +1864,7 @@ static void printUsage(const char* programName) {
     std::cerr << "       " << programName << " --bench-gen [batches] [threads]   (scalar point-gen)\n";
     std::cerr << "       " << programName << " --bench-gen-ifma [batches] [thr]  (8-lane point-gen)\n";
     std::cerr << "       " << programName << " --bench-gen-blocks [batches][thr]  (block-path gen only)\n";
+    std::cerr << "       " << programName << " --bench-gen-blocks-ab [batch][thr] (inversion ILP A/B: 1- vs 2/4-chain)\n";
     std::cerr << "       " << programName << " --bench-hash [batches] [threads]  (hash160 only)\n";
     std::cerr << "       " << programName << " --bench-hash-blocks [batches][thr] (packed vs gather SHA, A/B)\n";
     std::cerr << "       " << programName << " --bench-overlap [iters] [threads] (gen/hash port-overlap probe)\n";
@@ -1754,6 +1942,15 @@ int main(int argc, char* argv[])
             if (i + 2 < argc) { int t = std::atoi(argv[i + 2]); if (t > 0) benchThreads = t; }
             Secp256K1 secp; secp.Init();
             runBenchOverlap(secp, iters, benchThreads);
+            return 0;
+        }
+        if (!std::strcmp(argv[i], "--bench-gen-blocks-ab")) {
+            long long batches = 1000;
+            int benchThreads = 0;
+            if (i + 1 < argc) { long long v = std::strtoll(argv[i + 1], nullptr, 10); if (v > 0) batches = v; }
+            if (i + 2 < argc) { int t = std::atoi(argv[i + 2]); if (t > 0) benchThreads = t; }
+            Secp256K1 secp; secp.Init();
+            runBenchGenBlocksAB(secp, batches, benchThreads);
             return 0;
         }
         if (!std::strcmp(argv[i], "--bench") ||
