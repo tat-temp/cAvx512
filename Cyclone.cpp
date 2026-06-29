@@ -1036,10 +1036,15 @@ static void genGroupIFMABlocks_impl(Point &startP, Point *Gn, Point &_2Gn,
     startP = pp;
 }
 
-// Production block-path group generator: the validated single-chain batch inversion.
+// Production block-path group generator. Uses the split-chain (G=4) batch
+// inversion: a same-binary A/B (--bench-gen-blocks-ab) measured it ~+6% over the
+// single-chain on this CPU at both 1T and all-core, from breaking the serial
+// prefix-product recurrence into 4 interleaved chains to hide IFMA latency. The
+// single-chain ifma_batchInvertSoA_sub stays as the independent --selftest-ifma
+// reference (and this path is cross-checked against the scalar ModInv Point path).
 static void genGroupIFMABlocks(Point &startP, Point *Gn, Point &_2Gn,
                                std::vector<Int> &dx, IntGroup &grp, uint8_t *blocks) {
-    genGroupIFMABlocks_impl<ifma_batchInvertSoA_sub>(startP, Gn, _2Gn, dx, grp, blocks);
+    genGroupIFMABlocks_impl<ifma_batchInvertSoA_sub_split<4>>(startP, Gn, _2Gn, dx, grp, blocks);
 }
 
 // Production IFMA search path: generate the whole 4096-point group straight into
